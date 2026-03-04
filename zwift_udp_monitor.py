@@ -6,9 +6,12 @@ and broadcasts instant power/HR/cadence/speed data via local UDP (127.0.0.1:7878
 Must be run as Administrator (Npcap requires elevated privileges).
 """
 
+from __future__ import annotations
+
 import json
 import socket
 import struct
+import sys
 import threading
 import time
 
@@ -17,6 +20,8 @@ import pcapy
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+__version__ = "1.0.1"  # Bumped from 1.0.0 due to bugfixes
 
 ZWIFT_UDP_PORT = 3022
 BROADCAST_HOST = "127.0.0.1"
@@ -226,6 +231,12 @@ class ZwiftDataStore:
             self._last_update = time.time()
             self._total_packets += 1
 
+    @property
+    def rider_id(self) -> int:
+        """Return the current rider ID in a thread-safe manner."""
+        with self._lock:
+            return self._rider_id
+
     def get_data(self) -> dict:
         """Return a dict with human-readable converted values."""
         with self._lock:
@@ -327,11 +338,12 @@ def run_broadcast_loop(
     """Periodically broadcast the latest data via UDP every BROADCAST_INTERVAL seconds."""
     while not stop_event.is_set():
         data = store.get_data()
-        try:
-            broadcaster.send(data)
-            broadcaster.log_console(data)
-        except OSError:
-            pass
+        if data["total_packets"] > 0:  # Only send once real Zwift data has arrived
+            try:
+                broadcaster.send(data)
+                broadcaster.log_console(data)
+            except OSError:
+                pass
         stop_event.wait(BROADCAST_INTERVAL)
 
 
@@ -392,7 +404,7 @@ def run_capture(
             _header, raw_packet = cap.next()
         except pcapy.PcapError:
             continue
-        if raw_packet is None:
+        if not raw_packet:  # None, b'', 0-length bytes all caught
             continue
 
         parsed = _parse_udp_payload(raw_packet)
@@ -402,10 +414,13 @@ def run_capture(
 
         try:
             if src_port == ZWIFT_UDP_PORT:
-                # ServerToClient – contains other riders as well
+                # ServerToClient – contains other riders as well; only update our own
                 states = parser.parse_incoming(udp_payload)
-                for state in states:
-                    store.update(state)
+                my_rider_id = store.rider_id
+                if my_rider_id != 0:
+                    for state in states:
+                        if state.get("rider_id") == my_rider_id:
+                            store.update(state)
 
             elif dst_port == ZWIFT_UDP_PORT:
                 # ClientToServer – our own rider (primary data source)
@@ -421,33 +436,37 @@ def run_capture(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("=" * 60)
-    print(" Zwift UDP Monitor v1.0.0")
-    print(" Captures Zwift traffic and broadcasts to smart-fan-controller")
-    print("=" * 60)
-
-    device = select_network_interface()
-    store = ZwiftDataStore()
-    broadcaster = UDPBroadcaster()
-    stop_event = threading.Event()
-
-    broadcast_thread = threading.Thread(
-        target=run_broadcast_loop,
-        args=(store, broadcaster, stop_event),
-        daemon=True,
-        name="broadcast",
-    )
-    broadcast_thread.start()
-
     try:
-        run_capture(device, store, stop_event)
-    except KeyboardInterrupt:
-        print("\n\nLeállítás… / Stopping…")
-    finally:
-        stop_event.set()
-        broadcast_thread.join(timeout=2)
-        broadcaster.close()
-        print("Kész / Done.")
+        print("=" * 60)
+        print(f" Zwift UDP Monitor v{__version__}")
+        print(" Captures Zwift traffic and broadcasts to smart-fan-controller")
+        print("=" * 60)
+
+        device = select_network_interface()
+        store = ZwiftDataStore()
+        broadcaster = UDPBroadcaster()
+        stop_event = threading.Event()
+
+        broadcast_thread = threading.Thread(
+            target=run_broadcast_loop,
+            args=(store, broadcaster, stop_event),
+            daemon=True,
+            name="broadcast",
+        )
+        broadcast_thread.start()
+
+        try:
+            run_capture(device, store, stop_event)
+        except KeyboardInterrupt:
+            print("\n\nLeállítás… / Stopping…")
+        finally:
+            stop_event.set()
+            broadcast_thread.join(timeout=2)
+            broadcaster.close()
+            print("Kész / Done.")
+    except RuntimeError as e:
+        print(f"\n❌ {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
