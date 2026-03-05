@@ -399,6 +399,8 @@ def run_listener(
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        # Bind to all interfaces so broadcast packets from ZCA are received
+        # regardless of which network interface the phone uses.
         sock.bind(("0.0.0.0", ZCA_UDP_PORT))
         sock.settimeout(1.0)
     except OSError as exc:
@@ -445,7 +447,7 @@ def run_listener(
                             f"store.rider_id={store.rider_id}"
                         )
                 else:
-                    # Fall back to direct PlayerState parse
+                    # Fall back to direct PlayerState parse when S2C wrapper is empty
                     state = parser.parse_player_state(data)
                     if ZwiftPacketParser._state_has_data(state):
                         store.update(state)

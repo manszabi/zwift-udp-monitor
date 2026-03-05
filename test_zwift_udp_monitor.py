@@ -591,6 +591,7 @@ class TestRunListenerRiderFiltering(unittest.TestCase):
         states = self.parser.parse_incoming(udp_payload)
         my_rider_id = self.store.rider_id
         if my_rider_id == 0:
+            # Bootstrap: accept first state with a valid rider_id
             for state in states:
                 if state.get("rider_id", 0) != 0:
                     self.store.update(state)
