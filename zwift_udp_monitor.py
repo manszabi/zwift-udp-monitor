@@ -1,9 +1,11 @@
 """
-zwift_udp_monitor.py – Zwift UDP forgalom figyelő és továbbító
-Captures Zwift UDP traffic (port 3024), decodes protobuf messages,
-and broadcasts instant power/HR/cadence/speed data via local UDP (127.0.0.1:7878).
+zwift_udp_monitor.py – Zwift Companion App UDP listener és adattovábbító
+Listens for Zwift Companion App (ZCA) UDP broadcast packets on port 21587,
+decodes protobuf messages, and broadcasts instant power/HR/cadence/speed
+data via local UDP (127.0.0.1:7878).
 
-Must be run as Administrator (Npcap requires elevated privileges).
+No admin privileges or Npcap required – uses a plain UDP socket.
+Requires the Zwift Companion App running on the same Wi-Fi network.
 """
 
 from __future__ import annotations
@@ -16,18 +18,13 @@ import sys
 import threading
 import time
 
-import pcapy
-
-import ctypes
-import os
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "1.0.1"  # Bumped from 1.0.0 due to bugfixes
+__version__ = "2.0.0"
 
-ZWIFT_UDP_PORT = 3024
+ZCA_UDP_PORT = 21587      # Zwift Companion App local broadcast port
 BROADCAST_HOST = "127.0.0.1"
 BROADCAST_PORT = 7878
 BROADCAST_INTERVAL = 1.0  # seconds
@@ -359,43 +356,6 @@ class UDPBroadcaster:
 
 
 # ---------------------------------------------------------------------------
-# Network interface selection
-# ---------------------------------------------------------------------------
-
-def select_network_interface() -> str:
-    """Interactive Npcap interface selector. Returns the chosen device name."""
-    try:
-        devices = pcapy.findalldevs()
-    except Exception as exc:
-        raise RuntimeError(
-            "No network interfaces found. "
-            "Make sure Npcap is installed with 'WinPcap API-compatible Mode' enabled."
-        ) from exc
-
-    if not devices:
-        raise RuntimeError(
-            "No network interfaces found. "
-            "Make sure Npcap is installed with 'WinPcap API-compatible Mode' enabled."
-        )
-
-    print("\nElérhető hálózati interfészek / Available network interfaces:")
-    for idx, dev in enumerate(devices):
-        print(f"  [{idx}] {dev}")
-
-    while True:
-        try:
-            choice = input("\nVálassz interfészt (szám) / Select interface (number): ").strip()
-            index = int(choice)
-            if 0 <= index < len(devices):
-                return devices[index]
-            print(f"Érvénytelen szám. Adjon meg 0–{len(devices) - 1} közötti értéket.")
-        except ValueError:
-            print("Kérjük, adjon meg egy számot / Please enter a number.")
-        except (EOFError, KeyboardInterrupt):
-            raise
-
-
-# ---------------------------------------------------------------------------
 # Broadcast loop (runs in a background thread)
 # ---------------------------------------------------------------------------
 
@@ -417,151 +377,91 @@ def run_broadcast_loop(
 
 
 # ---------------------------------------------------------------------------
-# Packet capture loop
+# ZCA UDP listener loop
 # ---------------------------------------------------------------------------
 
-def _parse_udp_payload(raw_packet: bytes):
-    """Extract (src_port, dst_port, udp_payload) from a raw Ethernet frame.
-
-    Returns None if the frame is not IPv4/UDP or is too short.
-    """
-    # Ethernet header: 14 bytes
-    if len(raw_packet) < 14:
-        return None
-    eth_type = struct.unpack_from("!H", raw_packet, 12)[0]
-    if eth_type != 0x0800:  # IPv4 only
-        return None
-
-    ip_start = 14
-    if len(raw_packet) < ip_start + 20:
-        return None
-    ip_ihl = (raw_packet[ip_start] & 0x0F) * 4
-    ip_proto = raw_packet[ip_start + 9]
-    if ip_proto != 17:  # UDP only
-        return None
-
-    udp_start = ip_start + ip_ihl
-    if len(raw_packet) < udp_start + 8:
-        return None
-    src_port, dst_port = struct.unpack_from("!HH", raw_packet, udp_start)
-    udp_payload = raw_packet[udp_start + 8:]
-    return src_port, dst_port, udp_payload
-
-
-def run_capture(
-    device: str,
+def run_listener(
     store: ZwiftDataStore,
     stop_event: threading.Event,
     *,
     debug: bool = False,
 ) -> None:
-    """Open a pcapy capture on *device* and decode Zwift UDP packets."""
+    """Listen for Zwift Companion App UDP broadcast packets on ZCA_UDP_PORT.
+
+    Each received datagram is attempted to be decoded first as a
+    ServerToClient wrapper (field 8 repeated PlayerState), and if that
+    yields no data, as a raw PlayerState directly.
+    """
     parser = ZwiftPacketParser()
     parse_errors = 0
 
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        cap = pcapy.open_live(device, 65536, True, 1000)
-    except Exception as exc:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        # Bind to all interfaces so broadcast packets from ZCA are received
+        # regardless of which network interface the phone uses.
+        sock.bind(("0.0.0.0", ZCA_UDP_PORT))
+        sock.settimeout(1.0)
+    except OSError as exc:
+        sock.close()
         raise RuntimeError(
-            f"Failed to start capture on '{device}'. "
-            "Make sure you are running as Administrator."
+            f"Failed to bind UDP socket on port {ZCA_UDP_PORT}: {exc}"
         ) from exc
 
-    cap.setfilter(f"udp port {ZWIFT_UDP_PORT}")
-    print(f"\nCapturing on {device} – BPF: udp port {ZWIFT_UDP_PORT}")
+    print(f"\nListening for ZCA broadcasts on UDP port {ZCA_UDP_PORT}")
+    print("Make sure the Zwift Companion App is running on the same Wi-Fi network.")
     print("Press Ctrl+C to stop.\n")
 
-    while not stop_event.is_set():
-        try:
-            _header, raw_packet = cap.next()
-        except pcapy.PcapError:
-            continue
-        if not raw_packet:  # None, b'', 0-length bytes all caught
-            continue
+    try:
+        while not stop_event.is_set():
+            try:
+                data, addr = sock.recvfrom(65536)
+            except socket.timeout:
+                continue
 
-        parsed = _parse_udp_payload(raw_packet)
-        if parsed is None:
-            continue
-        src_port, dst_port, udp_payload = parsed
+            if debug:
+                print(
+                    f"\n[DEBUG] {len(data)}B from {addr[0]}:{addr[1]} "
+                    f"hex={data[:32].hex()}"
+                )
 
-        if debug:
-            direction = "S→C" if src_port == ZWIFT_UDP_PORT else "C→S"
-            print(
-                f"\n[DEBUG] {direction} {len(udp_payload)}B "
-                f"src={src_port} dst={dst_port} "
-                f"hex={udp_payload[:32].hex()}"
-            )
-
-        try:
-            if src_port == ZWIFT_UDP_PORT:
-                # ServerToClient – contains multiple riders
-                states = parser.parse_incoming(udp_payload)
-                my_rider_id = store.rider_id
-                if my_rider_id == 0:
-                    # Bootstrap: accept the first state with a valid rider_id so the
-                    # display works while we wait for a successful outgoing parse
-                    for state in states:
-                        if state.get("rider_id", 0) != 0:
-                            store.update(state)
-                            break
+            try:
+                # Try ServerToClient wrapper first (field 8 repeated PlayerStates)
+                states = parser.parse_incoming(data)
+                if states:
+                    my_rider_id = store.rider_id
+                    if my_rider_id == 0:
+                        # Bootstrap: accept first state with a valid rider_id
+                        for state in states:
+                            if state.get("rider_id", 0) != 0:
+                                store.update(state)
+                                break
+                    else:
+                        for state in states:
+                            if state.get("rider_id") == my_rider_id:
+                                store.update(state)
+                    if debug:
+                        print(
+                            f"[DEBUG] S2C wrapper: {len(states)} state(s), "
+                            f"store.rider_id={store.rider_id}"
+                        )
                 else:
-                    for state in states:
-                        if state.get("rider_id") == my_rider_id:
-                            store.update(state)
+                    # Fall back to direct PlayerState parse when S2C wrapper is empty
+                    state = parser.parse_player_state(data)
+                    if ZwiftPacketParser._state_has_data(state):
+                        store.update(state)
+                        if debug:
+                            print(f"[DEBUG] direct PlayerState: {state!r}")
 
-                if debug:
-                    print(f"[DEBUG] S→C: parsed {len(states)} state(s), store.rider_id={store.rider_id}")
+            except Exception as exc:
+                parse_errors += 1
+                if debug or parse_errors <= 3:
+                    print(f"[WARN] parse error #{parse_errors}: {exc!r}")
+    finally:
+        sock.close()
 
-            elif dst_port == ZWIFT_UDP_PORT:
-                # ClientToServer – our own rider (primary data source)
-                state = parser.parse_outgoing(udp_payload)
-                if state:
-                    store.update(state)
 
-                if debug:
-                    print(f"[DEBUG] C→S: parsed {state!r}")
-
-        except Exception as exc:
-            parse_errors += 1
-            if debug or parse_errors <= 3:
-                print(f"[WARN] parse error #{parse_errors}: {exc!r}")
-
-def ensure_admin() -> None:
-    """Ensure the script is running with Administrator privileges on Windows.
-    
-    If not elevated, re-launch itself via UAC (ShellExecuteW 'runas') and exit.
-    On non-Windows platforms this is a no-op.
-    """
-    if os.name != "nt":
-        return  # Nem Windows – nem szükséges
-
-    try:
-        is_admin = ctypes.windll.shell32.IsUserAnAdmin()
-    except AttributeError:
-        is_admin = False
-
-    if is_admin:
-        return  # Már adminként futunk
-
-    print("⚠️  Adminisztrátori jogosultság szükséges / Administrator privileges required.")
-    print("   UAC prompt megnyitása… / Opening UAC prompt…")
-
-    # Re-launch the same script with 'runas' verb (triggers UAC dialog)
-    try:
-        ctypes.windll.shell32.ShellExecuteW(
-            None,                   # hwnd
-            "runas",                # lpOperation – request elevation
-            sys.executable,         # lpFile – python.exe
-            " ".join(sys.argv),     # lpParameters – script + args
-            None,                   # lpDirectory
-            1,                      # nShowCmd – SW_SHOWNORMAL
-        )
-    except Exception as exc:
-        print(f"❌ Nem sikerült adminként újraindítani / Failed to re-launch as admin: {exc}")
-        sys.exit(1)
-
-    sys.exit(0)  # Az eredeti (nem emelt) folyamat kilép
-    
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -571,18 +471,16 @@ def main() -> None:
     arg_parser.add_argument(
         "--debug",
         action="store_true",
-        help="Enable verbose packet logging (direction, size, hex dump, parse results)",
+        help="Enable verbose packet logging (size, hex dump, parse results)",
     )
     args = arg_parser.parse_args()
 
-    ensure_admin()
     try:
         print("=" * 60)
         print(f" Zwift UDP Monitor v{__version__}")
-        print(" Captures Zwift traffic and broadcasts to smart-fan-controller")
+        print(" Listens for ZCA broadcasts and forwards to smart-fan-controller")
         print("=" * 60)
 
-        device = select_network_interface()
         store = ZwiftDataStore()
         broadcaster = UDPBroadcaster()
         stop_event = threading.Event()
@@ -596,7 +494,7 @@ def main() -> None:
         broadcast_thread.start()
 
         try:
-            run_capture(device, store, stop_event, debug=args.debug)
+            run_listener(store, stop_event, debug=args.debug)
         except KeyboardInterrupt:
             print("\n\nLeállítás… / Stopping…")
         finally:
