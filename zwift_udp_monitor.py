@@ -17,6 +17,9 @@ import time
 
 import pcapy
 
+import ctypes
+import os
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -430,12 +433,48 @@ def run_capture(
         except Exception:
             pass
 
+def ensure_admin() -> None:
+    """Ensure the script is running with Administrator privileges on Windows.
+    
+    If not elevated, re-launch itself via UAC (ShellExecuteW 'runas') and exit.
+    On non-Windows platforms this is a no-op.
+    """
+    if os.name != "nt":
+        return  # Nem Windows – nem szükséges
 
+    try:
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin()
+    except AttributeError:
+        is_admin = False
+
+    if is_admin:
+        return  # Már adminként futunk
+
+    print("⚠️  Adminisztrátori jogosultság szükséges / Administrator privileges required.")
+    print("   UAC prompt megnyitása… / Opening UAC prompt…")
+
+    # Re-launch the same script with 'runas' verb (triggers UAC dialog)
+    try:
+        ctypes.windll.shell32.ShellExecuteW(
+            None,                   # hwnd
+            "runas",                # lpOperation – request elevation
+            sys.executable,         # lpFile – python.exe
+            " ".join(sys.argv),     # lpParameters – script + args
+            None,                   # lpDirectory
+            1,                      # nShowCmd – SW_SHOWNORMAL
+        )
+    except Exception as exc:
+        print(f"❌ Nem sikerült adminként újraindítani / Failed to re-launch as admin: {exc}")
+        sys.exit(1)
+
+    sys.exit(0)  # Az eredeti (nem emelt) folyamat kilép
+    
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    ensure_admin()
     try:
         print("=" * 60)
         print(f" Zwift UDP Monitor v{__version__}")
