@@ -193,8 +193,7 @@ class TestZwiftAPIClient(unittest.TestCase):
 
     @patch("zwift_api_polling.requests.Session.get")
     def test_get_player_state_success(self, mock_get):
-        state = {"riderId": 123, "power": 250, "heartrate": 160, "cadence": 90, "speed": 35.0}
-        mock_get.return_value = _mock_json_response(state)
+        mock_get.return_value = _mock_binary_response(_SAMPLE_PLAYER_STATE_PROTO)
         client = self._make_client()
         result = client.get_player_state(world_id=1, rider_id=123)
         self.assertEqual(result["power"], 250)
@@ -318,31 +317,43 @@ class TestZwiftAPIClientProtobuf(unittest.TestCase):
         self.assertIsNone(result)
 
     @patch("zwift_api_polling.requests.Session.get")
-    def test_get_player_state_json_decode_error_returns_none(self, mock_get):
-        """A JSON Content-Type response that fails to parse should return None."""
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.headers = {"Content-Type": "application/json"}
-        resp.content = b"\x00\x01invalid"
-        resp.json.side_effect = json.JSONDecodeError("Expecting value", "", 0)
-        resp.raise_for_status.return_value = None
-        mock_get.return_value = resp
+    def test_get_player_state_returns_none_on_406(self, mock_get):
+        """406 Not Acceptable (relay rejects Accept header) → None, no exception."""
+        mock_get.return_value = _mock_json_response({}, status_code=406)
         client = self._make_client()
         result = client.get_player_state(world_id=1, rider_id=123)
         self.assertIsNone(result)
 
     @patch("zwift_api_polling.requests.Session.get")
-    def test_get_player_state_sends_accept_header(self, mock_get):
-        """Requests should carry Accept: application/json header."""
-        mock_get.return_value = _mock_json_response(
-            {"riderId": 1, "power": 100, "heartrate": 140, "cadence": 80, "speed": 30.0}
-        )
+    def test_get_player_state_does_not_send_accept_json_header(self, mock_get):
+        """Relay endpoint must NOT receive Accept: application/json (only protobuf)."""
+        mock_get.return_value = _mock_binary_response(_SAMPLE_PLAYER_STATE_PROTO)
         client = self._make_client()
         client.get_player_state(world_id=1, rider_id=1)
         _, kwargs = mock_get.call_args
         headers = kwargs.get("headers", {})
-        self.assertEqual(headers.get("Accept"), "application/json")
+        self.assertNotEqual(headers.get("Accept"), "application/json")
         self.assertEqual(headers.get("Zwift-Api-Version"), "2.6")
+
+    @patch("zwift_api_polling.requests.Session.get")
+    def test_get_profile_sends_accept_json_header(self, mock_get):
+        """get_profile should send Accept: application/json (endpoint supports JSON)."""
+        mock_get.return_value = _mock_json_response({"id": 99})
+        client = self._make_client()
+        client.get_profile()
+        _, kwargs = mock_get.call_args
+        headers = kwargs.get("headers", {})
+        self.assertEqual(headers.get("Accept"), "application/json")
+
+    @patch("zwift_api_polling.requests.Session.get")
+    def test_get_active_world_sends_accept_json_header(self, mock_get):
+        """get_active_world should send Accept: application/json (endpoint supports JSON)."""
+        mock_get.return_value = _mock_json_response([{"worldId": 1}])
+        client = self._make_client()
+        client.get_active_world(rider_id=123)
+        _, kwargs = mock_get.call_args
+        headers = kwargs.get("headers", {})
+        self.assertEqual(headers.get("Accept"), "application/json")
 
     # -- get_active_world -----------------------------------------------------
 
