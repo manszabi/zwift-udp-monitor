@@ -2,25 +2,22 @@
 test_zwift_udp_monitor.py – Unit tests for zwift_udp_monitor.py
 
 Uses unittest (consistent with the smart-fan-controller project).
-pcapy is mocked so these tests run on any platform without Npcap.
+No external dependencies required – the module no longer uses pcapy.
 """
 
+import socket
 import struct
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
-# ---------------------------------------------------------------------------
-# Mock pcapy before importing the module under test (platform-dependent)
-# ---------------------------------------------------------------------------
-
-sys.modules.setdefault("pcapy", MagicMock())
-
 from zwift_udp_monitor import (  # noqa: E402
     ProtobufDecoder,
     UDPBroadcaster,
+    ZCA_UDP_PORT,
     ZwiftDataStore,
     ZwiftPacketParser,
+    run_listener,
 )
 
 # ---------------------------------------------------------------------------
@@ -570,15 +567,15 @@ class TestUDPBroadcaster(unittest.TestCase):
 
 
 # ===========================================================================
-# 7. Integration tests – run_capture rider-ID filtering (Bug #1 regression)
+# 7. Integration tests – run_listener rider-ID filtering (Bug #1 regression)
 # ===========================================================================
 
 
-class TestRunCaptureRiderFiltering(unittest.TestCase):
+class TestRunListenerRiderFiltering(unittest.TestCase):
     """Regression tests for Bug #1: rider_id bootstrap and incoming-packet filtering.
 
-    These tests replicate the exact conditional logic from run_capture()
-    without touching the network layer (pcapy).
+    These tests replicate the exact conditional logic from run_listener()
+    without touching the network layer.
     """
 
     def setUp(self):
@@ -586,21 +583,14 @@ class TestRunCaptureRiderFiltering(unittest.TestCase):
         self.store = ZwiftDataStore()
 
     # ------------------------------------------------------------------
-    # Helpers that mirror the logic inside run_capture()
+    # Helpers that mirror the S2C wrapper logic inside run_listener()
     # ------------------------------------------------------------------
 
-    def _process_outgoing(self, udp_payload: bytes) -> None:
-        """Simulate run_capture handling a ClientToServer packet."""
-        state = self.parser.parse_outgoing(udp_payload)
-        if state:
-            self.store.update(state)
-
-    def _process_incoming(self, udp_payload: bytes) -> None:
-        """Simulate run_capture handling a ServerToClient packet."""
+    def _process_s2c(self, udp_payload: bytes) -> None:
+        """Simulate run_listener handling a ServerToClient wrapper packet."""
         states = self.parser.parse_incoming(udp_payload)
         my_rider_id = self.store.rider_id
         if my_rider_id == 0:
-            # Bootstrap: accept first state with a valid rider_id
             for state in states:
                 if state.get("rider_id", 0) != 0:
                     self.store.update(state)
@@ -610,6 +600,12 @@ class TestRunCaptureRiderFiltering(unittest.TestCase):
                 if state.get("rider_id") == my_rider_id:
                     self.store.update(state)
 
+    def _process_direct(self, udp_payload: bytes) -> None:
+        """Simulate run_listener handling a direct PlayerState packet."""
+        state = self.parser.parse_player_state(udp_payload)
+        if ZwiftPacketParser._state_has_data(state):
+            self.store.update(state)
+
     # ------------------------------------------------------------------
     # Tests
     # ------------------------------------------------------------------
@@ -618,7 +614,7 @@ class TestRunCaptureRiderFiltering(unittest.TestCase):
         """When rider_id is 0, the first incoming state with a valid rider_id bootstraps it."""
         self.assertEqual(self.store.rider_id, 0)
         ps_bytes = _make_player_state_bytes(rider_id=12345, power=200)
-        self._process_incoming(_make_ld_field(8, ps_bytes))
+        self._process_s2c(_make_ld_field(8, ps_bytes))
         # Bootstrap: first incoming state sets the rider_id and increments total_packets
         self.assertEqual(self.store.rider_id, 12345)
         self.assertEqual(self.store.get_data()["total_packets"], 1)
@@ -627,25 +623,25 @@ class TestRunCaptureRiderFiltering(unittest.TestCase):
         """Incoming packet with rider_id=0 does not bootstrap the store."""
         self.assertEqual(self.store.rider_id, 0)
         ps_bytes = _make_player_state_bytes(rider_id=0, power=200)
-        self._process_incoming(_make_ld_field(8, ps_bytes))
+        self._process_s2c(_make_ld_field(8, ps_bytes))
         self.assertEqual(self.store.get_data()["total_packets"], 0)
 
     def test_incoming_only_own_rider_updated(self):
         """Incoming packet for a different rider does not touch the store."""
-        # Establish our own rider via an outgoing packet
+        # Establish our own rider via S2C bootstrap
         own_ps = _make_player_state_bytes(rider_id=12345, power=200)
-        self._process_outgoing(_make_outgoing_packet(own_ps, skip_type="no_skip"))
+        self._process_s2c(_make_ld_field(8, own_ps))
         self.assertEqual(self.store.rider_id, 12345)
 
-        packets_after_outgoing = self.store.get_data()["total_packets"]
+        packets_after_bootstrap = self.store.get_data()["total_packets"]
 
         # Incoming packet belongs to a different rider
         other_ps = _make_player_state_bytes(rider_id=99999, power=350)
-        self._process_incoming(_make_ld_field(8, other_ps))
+        self._process_s2c(_make_ld_field(8, other_ps))
 
         self.assertEqual(
             self.store.get_data()["total_packets"],
-            packets_after_outgoing,
+            packets_after_bootstrap,
             "Store must not be updated for a foreign rider_id",
         )
 
@@ -653,21 +649,36 @@ class TestRunCaptureRiderFiltering(unittest.TestCase):
         """Incoming packet that matches our rider_id updates the store."""
         own_rider_id = 12345
         own_ps = _make_player_state_bytes(rider_id=own_rider_id, power=200)
-        self._process_outgoing(_make_outgoing_packet(own_ps, skip_type="no_skip"))
+        self._process_s2c(_make_ld_field(8, own_ps))
 
-        packets_after_outgoing = self.store.get_data()["total_packets"]
+        packets_after_bootstrap = self.store.get_data()["total_packets"]
 
         # Incoming packet belongs to our own rider
         own_incoming_ps = _make_player_state_bytes(
             rider_id=own_rider_id, power=275
         )
-        self._process_incoming(_make_ld_field(8, own_incoming_ps))
+        self._process_s2c(_make_ld_field(8, own_incoming_ps))
 
         self.assertGreater(
             self.store.get_data()["total_packets"],
-            packets_after_outgoing,
+            packets_after_bootstrap,
             "Store must be updated when incoming rider_id matches our own",
         )
+
+    def test_direct_playerstate_updates_store(self):
+        """A raw PlayerState packet (ZCA direct format) is parsed and stored."""
+        ps_bytes = _make_player_state_bytes(rider_id=55555, power=310, heartrate=162)
+        self._process_direct(ps_bytes)
+        data = self.store.get_data()
+        self.assertEqual(data["power"], 310)
+        self.assertEqual(data["heartrate"], 162)
+        self.assertEqual(self.store.rider_id, 55555)
+
+    def test_direct_playerstate_all_zeros_not_stored(self):
+        """A raw PlayerState with all-zero fields is not stored (no useful data)."""
+        ps_bytes = _make_player_state_bytes()  # all None → all-zero defaults
+        self._process_direct(ps_bytes)
+        self.assertEqual(self.store.get_data()["total_packets"], 0)
 
 
 # ===========================================================================
@@ -813,35 +824,69 @@ class TestStateHasData(unittest.TestCase):
 
 
 # ===========================================================================
-# 11. run_capture() --debug flag tests
+# 11. run_listener() --debug flag and socket setup tests
 # ===========================================================================
 
 
-class TestRunCaptureDebugFlag(unittest.TestCase):
-    """Tests for the --debug argument passed to run_capture()."""
+class TestRunListenerDebugAndSocket(unittest.TestCase):
+    """Tests for the --debug argument and socket setup in run_listener()."""
 
     def setUp(self):
         self.parser = ZwiftPacketParser()
         self.store = ZwiftDataStore()
 
-    def test_debug_output_on_parse_error(self):
-        """With debug=True, parse errors produce a [WARN] print (not silently swallowed)."""
-        # We simulate the exception-handling part of run_capture by checking that
-        # the _parse_errors counter path would print with debug=True.
-        # Use a direct integration: call parse_outgoing with truly bad data and
-        # confirm no exception escapes (the except clause handles it).
-        # The simplest check: parse_outgoing never raises, it returns None for garbage.
-        result = self.parser.parse_outgoing(b"\xFF\xFF\xFF\xFF\xFF\xFF")
-        # Should not raise; returns None or a (possibly all-zero) dict
-        self.assertIsNone(result)
-
-    def test_parse_outgoing_never_raises(self):
-        """parse_outgoing() must not raise for any short or garbled input."""
+    def test_parse_player_state_never_raises_on_garbage(self):
+        """parse_player_state() must not raise for any short or garbled input."""
         for bad_input in [b"", b"\x00", b"\xff" * 6, b"\x80" * 10, b"\x01\x02\x03\x04\x05\x06"]:
             try:
-                self.parser.parse_outgoing(bad_input)
+                self.parser.parse_player_state(bad_input)
             except Exception as exc:
-                self.fail(f"parse_outgoing raised {exc!r} for input {bad_input!r}")
+                self.fail(f"parse_player_state raised {exc!r} for input {bad_input!r}")
+
+    def test_parse_incoming_never_raises_on_garbage(self):
+        """parse_incoming() must not raise for any garbled input."""
+        for bad_input in [b"", b"\x00", b"\xff" * 6, b"\x80" * 10]:
+            try:
+                self.parser.parse_incoming(bad_input)
+            except Exception as exc:
+                self.fail(f"parse_incoming raised {exc!r} for input {bad_input!r}")
+
+    def test_zca_udp_port_constant(self):
+        """ZCA_UDP_PORT is set to 21587."""
+        self.assertEqual(ZCA_UDP_PORT, 21587)
+
+    def test_run_listener_binds_correct_port(self):
+        """run_listener() creates a UDP socket bound to 0.0.0.0:ZCA_UDP_PORT."""
+        stop_event = MagicMock()
+        stop_event.is_set.side_effect = [False, True]  # one iteration then stop
+
+        mock_sock = MagicMock()
+        # Make recvfrom raise timeout so the loop exits cleanly
+        mock_sock.recvfrom.side_effect = socket.timeout
+
+        with patch("socket.socket", return_value=mock_sock):
+            run_listener(self.store, stop_event)
+
+        mock_sock.setsockopt.assert_any_call(
+            socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
+        )
+        mock_sock.setsockopt.assert_any_call(
+            socket.SOL_SOCKET, socket.SO_BROADCAST, 1
+        )
+        mock_sock.bind.assert_called_once_with(("0.0.0.0", ZCA_UDP_PORT))
+        mock_sock.close.assert_called()
+
+    def test_run_listener_raises_on_bind_failure(self):
+        """run_listener() raises RuntimeError when the socket bind fails."""
+        stop_event = MagicMock()
+        mock_sock = MagicMock()
+        mock_sock.bind.side_effect = OSError("port in use")
+
+        with patch("socket.socket", return_value=mock_sock):
+            with self.assertRaises(RuntimeError) as ctx:
+                run_listener(self.store, stop_event)
+
+        self.assertIn("21587", str(ctx.exception))
 
 
 # ---------------------------------------------------------------------------
