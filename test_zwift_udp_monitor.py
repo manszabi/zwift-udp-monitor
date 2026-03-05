@@ -5,6 +5,7 @@ Uses unittest (consistent with the smart-fan-controller project).
 pcapy is mocked so these tests run on any platform without Npcap.
 """
 
+import struct
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
@@ -41,6 +42,18 @@ def _make_varint_field(field_number: int, value: int) -> bytes:
     """Create a protobuf varint field (wire type 0)."""
     tag = (field_number << 3) | 0  # wire type 0
     return _encode_varint(tag) + _encode_varint(value)
+
+
+def _make_fixed32_field(field_number: int, value: int) -> bytes:
+    """Create a protobuf 32-bit fixed field (wire type 5)."""
+    tag = (field_number << 3) | 5  # wire type 5
+    return _encode_varint(tag) + struct.pack('<I', value)
+
+
+def _make_fixed64_field(field_number: int, value: int) -> bytes:
+    """Create a protobuf 64-bit fixed field (wire type 1)."""
+    tag = (field_number << 3) | 1  # wire type 1
+    return _encode_varint(tag) + struct.pack('<Q', value)
 
 
 def _make_ld_field(field_number: int, data: bytes) -> bytes:
@@ -614,6 +627,114 @@ class TestRunCaptureRiderFiltering(unittest.TestCase):
             packets_after_outgoing,
             "Store must be updated when incoming rider_id matches our own",
         )
+
+
+# ===========================================================================
+# 8. ZwiftPacketParser._to_int() tests
+# ===========================================================================
+
+
+class TestToInt(unittest.TestCase):
+    """Tests for ZwiftPacketParser._to_int() – bytes-to-int conversion."""
+
+    def test_to_int_with_int_value(self):
+        """An int value is returned unchanged."""
+        self.assertEqual(ZwiftPacketParser._to_int(42), 42)
+
+    def test_to_int_with_zero_int(self):
+        """Zero int is returned as zero."""
+        self.assertEqual(ZwiftPacketParser._to_int(0), 0)
+
+    def test_to_int_with_4_bytes_fixed32(self):
+        """4-byte little-endian bytes are decoded as uint32 (wire type 5)."""
+        raw = struct.pack('<I', 300)
+        self.assertEqual(ZwiftPacketParser._to_int(raw), 300)
+
+    def test_to_int_with_8_bytes_fixed64(self):
+        """8-byte little-endian bytes are decoded as uint64 (wire type 1)."""
+        raw = struct.pack('<Q', 1_234_567_890_123)
+        self.assertEqual(ZwiftPacketParser._to_int(raw), 1_234_567_890_123)
+
+    def test_to_int_with_unexpected_bytes_length_returns_default(self):
+        """bytes of unexpected length (not 4 or 8) returns the default."""
+        self.assertEqual(ZwiftPacketParser._to_int(b"\x01\x02\x03"), 0)
+        self.assertEqual(ZwiftPacketParser._to_int(b"\x01\x02\x03", default=99), 99)
+
+    def test_to_int_with_none_returns_default(self):
+        """None returns the default value."""
+        self.assertEqual(ZwiftPacketParser._to_int(None), 0)
+        self.assertEqual(ZwiftPacketParser._to_int(None, default=7), 7)
+
+
+# ===========================================================================
+# 9. parse_player_state() with fixed-width wire types (Bug #2 regression)
+# ===========================================================================
+
+
+class TestParsePlayerStateFixedWidth(unittest.TestCase):
+    """Regression tests for Bug #2: fixed-width fields must not cause JSON errors."""
+
+    def setUp(self):
+        self.parser = ZwiftPacketParser()
+
+    def test_heartrate_as_fixed32_is_int(self):
+        """heartrate encoded as wire type 5 (fixed32) is decoded to int."""
+        data = _make_fixed32_field(11, 150)  # field 11 = heartrate
+        result = self.parser.parse_player_state(data)
+        self.assertIsInstance(result["heartrate"], int)
+        self.assertEqual(result["heartrate"], 150)
+
+    def test_speed_as_fixed32_is_int(self):
+        """speed_mmh encoded as wire type 5 (fixed32) is decoded to int."""
+        data = _make_fixed32_field(6, 35_000_000)  # field 6 = speed_mmh
+        result = self.parser.parse_player_state(data)
+        self.assertIsInstance(result["speed_mmh"], int)
+        self.assertEqual(result["speed_mmh"], 35_000_000)
+
+    def test_power_as_fixed32_is_int(self):
+        """power encoded as wire type 5 (fixed32) is decoded to int."""
+        data = _make_fixed32_field(12, 250)  # field 12 = power
+        result = self.parser.parse_player_state(data)
+        self.assertIsInstance(result["power"], int)
+        self.assertEqual(result["power"], 250)
+
+    def test_rider_id_as_fixed64_is_int(self):
+        """rider_id encoded as wire type 1 (fixed64) is decoded to int."""
+        data = _make_fixed64_field(1, 99999)  # field 1 = rider_id
+        result = self.parser.parse_player_state(data)
+        self.assertIsInstance(result["rider_id"], int)
+        self.assertEqual(result["rider_id"], 99999)
+
+    def test_parse_player_state_all_fields_are_int(self):
+        """All fields in parse_player_state result must be int (JSON-serializable)."""
+        import json
+        data = (
+            _make_fixed32_field(1, 12345)       # rider_id as fixed32
+            + _make_fixed32_field(11, 150)      # heartrate as fixed32
+            + _make_fixed32_field(12, 250)      # power as fixed32
+            + _make_fixed32_field(6, 35_000_000)  # speed_mmh as fixed32
+            + _make_fixed32_field(9, 1_500_000)   # cadence_uhz as fixed32
+        )
+        result = self.parser.parse_player_state(data)
+        for key, value in result.items():
+            self.assertIsInstance(value, int, f"Field '{key}' should be int, got {type(value)}")
+        # Must be JSON-serializable without TypeError
+        serialized = json.dumps(result)
+        self.assertIsInstance(serialized, str)
+
+    def test_store_get_data_json_serializable_with_fixed_width_fields(self):
+        """ZwiftDataStore.get_data() is JSON-serializable even with bytes-derived values."""
+        import json
+        store = ZwiftDataStore()
+        # Simulate what happens when parse_player_state returns int from fixed32
+        data = _make_fixed32_field(11, 158)  # heartrate as fixed32
+        result = self.parser.parse_player_state(data)
+        store.update(result)
+        data_dict = store.get_data()
+        # Must not raise TypeError
+        serialized = json.dumps(data_dict)
+        self.assertIsInstance(serialized, str)
+        self.assertEqual(json.loads(serialized)["heartrate"], 158)
 
 
 # ---------------------------------------------------------------------------
