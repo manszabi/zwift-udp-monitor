@@ -250,56 +250,50 @@ class ZwiftAPIClient:
         self._session = requests.Session()
 
     def _headers(self) -> dict:
+        """Base headers without Accept – callers add their own Accept if needed."""
         return {
             "Authorization": f"Bearer {self._auth.access_token}",
-            "Accept": "application/json",
             "Zwift-Api-Version": "2.6",
         }
+
+    def _json_headers(self) -> dict:
+        """Headers for endpoints that support JSON responses."""
+        h = self._headers()
+        h["Accept"] = "application/json"
+        return h
 
     def get_profile(self) -> dict:
         """Return the authenticated user's profile (contains ``id``)."""
         url = f"{ZWIFT_API_BASE}/api/profiles/me"
-        resp = self._session.get(url, headers=self._headers(), timeout=10)
+        resp = self._session.get(url, headers=self._json_headers(), timeout=10)
         resp.raise_for_status()
         return resp.json()
 
     def get_player_state(self, world_id: int, rider_id: int) -> dict | None:
         """Return the latest player state dict or *None* if not riding.
 
-        Tries the relay/worlds endpoint which returns real-time data.
+        Tries the relay/worlds endpoint which returns real-time protobuf data.
         Falls back gracefully when the player is not in a world.
-        The endpoint may return JSON or binary protobuf depending on the API
-        version; both cases are handled transparently.
+        The relay endpoint only supports protobuf; JSON is never requested.
         """
         url = f"{ZWIFT_API_BASE}/relay/worlds/{world_id}/players/{rider_id}"
         resp = self._session.get(url, headers=self._headers(), timeout=10)
         if resp.status_code == 404:
             return None  # player not in this world
+        if resp.status_code == 406:
+            return None  # relay endpoint does not support the requested format
         if resp.status_code == 429:
             raise RateLimitError("Rate limited (429)")
         resp.raise_for_status()
 
-        content_type = resp.headers.get("Content-Type", "")
-        if "application/json" in content_type:
-            try:
-                return resp.json()
-            except json.JSONDecodeError as exc:
-                if self._debug:
-                    print(
-                        f"\n[DEBUG] JSON decode error on player state: {exc}"
-                        f"\n[DEBUG] Content-Type: {content_type}"
-                        f"\n[DEBUG] Response bytes[:64]: {resp.content[:64]!r}"
-                    )
-                return None
-        else:
-            # Binary / protobuf response from relay endpoint
-            if self._debug:
-                print(
-                    f"\n[DEBUG] Non-JSON player state response"
-                    f"\n[DEBUG] Content-Type: {content_type!r}"
-                    f"\n[DEBUG] Response bytes[:64]: {resp.content[:64]!r}"
-                )
-            return _parse_protobuf_player_state(resp.content)
+        if self._debug:
+            content_type = resp.headers.get("Content-Type", "")
+            print(
+                f"\n[DEBUG] Player state response"
+                f"\n[DEBUG] Content-Type: {content_type!r}"
+                f"\n[DEBUG] Response bytes[:64]: {resp.content[:64]!r}"
+            )
+        return _parse_protobuf_player_state(resp.content)
 
     def get_active_world(self, rider_id: int) -> int | None:
         """Try to determine the world the rider is currently in (1=Watopia etc.).
@@ -312,7 +306,7 @@ class ZwiftAPIClient:
         url = f"{ZWIFT_API_BASE}/api/profiles/{rider_id}/activities"
         params = {"limit": 1}
         resp = self._session.get(
-            url, headers=self._headers(), params=params, timeout=10
+            url, headers=self._json_headers(), params=params, timeout=10
         )
         if resp.status_code in (404, 204):
             return None
@@ -353,7 +347,7 @@ class ZwiftAPIClient:
         """Return the worldId from the rider's profile endpoint, or *None*."""
         url = f"{ZWIFT_API_BASE}/api/profiles/{rider_id}"
         try:
-            resp = self._session.get(url, headers=self._headers(), timeout=10)
+            resp = self._session.get(url, headers=self._json_headers(), timeout=10)
             if resp.status_code != 200:
                 return None
             content_type = resp.headers.get("Content-Type", "")
