@@ -33,7 +33,7 @@ __version__ = "1.0.0"
 
 BROADCAST_HOST = "127.0.0.1"
 BROADCAST_PORT = 7878
-DEFAULT_POLL_INTERVAL = 1.0  # seconds
+DEFAULT_POLL_INTERVAL = 5.0  # seconds
 
 ZWIFT_AUTH_URL = (
     "https://secure.zwift.com/auth/realms/zwift/protocol/openid-connect/token"
