@@ -1,6 +1,6 @@
 """
 zwift_udp_monitor.py – Zwift UDP forgalom figyelő és továbbító
-Captures Zwift UDP traffic (port 3022), decodes protobuf messages,
+Captures Zwift UDP traffic (port 3024), decodes protobuf messages,
 and broadcasts instant power/HR/cadence/speed data via local UDP (127.0.0.1:7878).
 
 Must be run as Administrator (Npcap requires elevated privileges).
@@ -26,7 +26,7 @@ import os
 
 __version__ = "1.0.1"  # Bumped from 1.0.0 due to bugfixes
 
-ZWIFT_UDP_PORT = 3022
+ZWIFT_UDP_PORT = 3024
 BROADCAST_HOST = "127.0.0.1"
 BROADCAST_PORT = 7878
 BROADCAST_INTERVAL = 1.0  # seconds
@@ -145,19 +145,36 @@ class ZwiftPacketParser:
     _S2C_PLAYER_STATES_FIELD = 8   # ServerToClient: repeated PlayerState
     _C2S_STATE_FIELD = 7           # ClientToServer: PlayerState
 
+    @staticmethod
+    def _to_int(value: int | bytes | None, default: int = 0) -> int:
+        """Convert a protobuf field value to int, handling bytes from fixed-width wire types.
+
+        Wire type 0 (varint) already returns int; wire types 1 and 5 return raw bytes.
+          - 4-byte value (wire type 5 / fixed32): decoded as little-endian uint32
+          - 8-byte value (wire type 1 / fixed64): decoded as little-endian uint64
+        """
+        if isinstance(value, int):
+            return value
+        if isinstance(value, bytes):
+            if len(value) == 4:
+                return struct.unpack('<I', value)[0]
+            if len(value) == 8:
+                return struct.unpack('<Q', value)[0]
+        return default
+
     def parse_player_state(self, data: bytes) -> dict:
         """Extract relevant fields from a raw PlayerState blob."""
         fields = ProtobufDecoder.parse_fields(data)
         return {
-            "rider_id": fields.get(self._PS_FIELD_ID, 0),
-            "world_time": fields.get(self._PS_FIELD_WORLD_TIME, 0),
-            "distance": fields.get(self._PS_FIELD_DISTANCE, 0),
-            "speed_mmh": fields.get(self._PS_FIELD_SPEED, 0),
-            "cadence_uhz": fields.get(self._PS_FIELD_CADENCE_UHZ, 0),
-            "heartrate": fields.get(self._PS_FIELD_HEARTRATE, 0),
-            "power": fields.get(self._PS_FIELD_POWER, 0),
-            "climbing": fields.get(self._PS_FIELD_CLIMBING, 0),
-            "elapsed_time": fields.get(self._PS_FIELD_TIME, 0),
+            "rider_id": self._to_int(fields.get(self._PS_FIELD_ID, 0)),
+            "world_time": self._to_int(fields.get(self._PS_FIELD_WORLD_TIME, 0)),
+            "distance": self._to_int(fields.get(self._PS_FIELD_DISTANCE, 0)),
+            "speed_mmh": self._to_int(fields.get(self._PS_FIELD_SPEED, 0)),
+            "cadence_uhz": self._to_int(fields.get(self._PS_FIELD_CADENCE_UHZ, 0)),
+            "heartrate": self._to_int(fields.get(self._PS_FIELD_HEARTRATE, 0)),
+            "power": self._to_int(fields.get(self._PS_FIELD_POWER, 0)),
+            "climbing": self._to_int(fields.get(self._PS_FIELD_CLIMBING, 0)),
+            "elapsed_time": self._to_int(fields.get(self._PS_FIELD_TIME, 0)),
         }
 
     def parse_incoming(self, data: bytes) -> list:
@@ -243,16 +260,22 @@ class ZwiftDataStore:
     def get_data(self) -> dict:
         """Return a dict with human-readable converted values."""
         with self._lock:
+            # Defense-in-depth: ensure stored values are int before arithmetic/JSON
+            power = int(self._power)
+            heartrate = int(self._heartrate)
+            cadence_uhz = int(self._cadence_uhz)
+            speed_mmh = int(self._speed_mmh)
+            rider_id = int(self._rider_id)
             # cadence: micro-hertz → RPM
-            cadence_rpm = int((self._cadence_uhz * 60) / MICROHERTZ_TO_HERTZ)
+            cadence_rpm = int((cadence_uhz * 60) / MICROHERTZ_TO_HERTZ)
             # speed: millimetres/hour → km/h
-            speed_kmh = round(self._speed_mmh / MM_PER_HOUR_TO_KM_PER_HOUR, 1)
+            speed_kmh = round(speed_mmh / MM_PER_HOUR_TO_KM_PER_HOUR, 1)
             return {
-                "power": self._power,
-                "heartrate": self._heartrate,
+                "power": power,
+                "heartrate": heartrate,
                 "cadence": cadence_rpm,
                 "speed_kmh": speed_kmh,
-                "rider_id": self._rider_id,
+                "rider_id": rider_id,
                 "last_update": self._last_update,
                 "total_packets": self._total_packets,
                 "timestamp": time.time(),
