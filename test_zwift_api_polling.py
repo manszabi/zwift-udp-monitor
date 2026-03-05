@@ -19,6 +19,8 @@ from zwift_api_polling import (
     ZwiftAPIClient,
     ZwiftAuth,
     ZwiftDataStore,
+    ProtobufDecoder,
+    _parse_protobuf_player_state,
     _sleep_remainder,
     resolve_credentials,
     build_arg_parser,
@@ -48,6 +50,7 @@ def _mock_token_response(
 def _mock_json_response(payload, status_code: int = 200) -> MagicMock:
     resp = MagicMock()
     resp.status_code = status_code
+    resp.headers = {"Content-Type": "application/json"}
     resp.json.return_value = payload
     if status_code >= 400:
         import requests
@@ -57,6 +60,37 @@ def _mock_json_response(payload, status_code: int = 200) -> MagicMock:
     else:
         resp.raise_for_status.return_value = None
     return resp
+
+
+def _mock_binary_response(
+    content: bytes,
+    content_type: str = "application/x-protobuf",
+    status_code: int = 200,
+) -> MagicMock:
+    """Create a mock response with binary content and a non-JSON Content-Type."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.headers = {"Content-Type": content_type}
+    resp.content = content
+    resp.json.side_effect = ValueError("Not JSON")
+    if status_code >= 400:
+        import requests
+        resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            f"{status_code} Error"
+        )
+    else:
+        resp.raise_for_status.return_value = None
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Shared test fixtures
+# ---------------------------------------------------------------------------
+
+# Manually encoded protobuf PlayerState: riderId=123, speed=36000000 mm/h
+# (36 km/h), cadenceUHz=1000000 (60 RPM), heartrate=160, power=250.
+# Each field is encoded as (tag_varint | value_varint) per the protobuf spec.
+_SAMPLE_PLAYER_STATE_PROTO = b'\x08{0\x80\xa2\x95\x11H\xc0\x84=X\xa0\x01`\xfa\x01'
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +241,168 @@ class TestZwiftAPIClient(unittest.TestCase):
         client = self._make_client()
         with self.assertRaises(RateLimitError):
             client.get_active_world(rider_id=123)
+
+
+# ---------------------------------------------------------------------------
+# ProtobufDecoder and _parse_protobuf_player_state tests
+# ---------------------------------------------------------------------------
+
+
+class TestProtobufDecoder(unittest.TestCase):
+    """Tests for the minimal protobuf field parser."""
+
+    def test_parse_fields_returns_dict(self):
+        fields = ProtobufDecoder.parse_fields(_SAMPLE_PLAYER_STATE_PROTO)
+        self.assertEqual(fields[1], 123)    # riderId
+        self.assertEqual(fields[6], 36000000)  # speed mm/h
+        self.assertEqual(fields[9], 1000000)   # cadence µHz
+        self.assertEqual(fields[11], 160)  # heartrate
+        self.assertEqual(fields[12], 250)  # power
+
+    def test_parse_fields_empty_bytes(self):
+        fields = ProtobufDecoder.parse_fields(b"")
+        self.assertEqual(fields, {})
+
+    def test_parse_fields_truncated_data(self):
+        # Should not raise; truncated varint falls back gracefully
+        fields = ProtobufDecoder.parse_fields(b"\x08")
+        self.assertIsInstance(fields, dict)
+
+    def test_parse_protobuf_player_state_converts_units(self):
+        state = _parse_protobuf_player_state(_SAMPLE_PLAYER_STATE_PROTO)
+        self.assertIsNotNone(state)
+        self.assertEqual(state["riderId"], 123)
+        self.assertEqual(state["power"], 250)
+        self.assertEqual(state["heartrate"], 160)
+        self.assertEqual(state["cadence"], 60)    # 1 000 000 µHz → 60 RPM
+        self.assertAlmostEqual(state["speed_kmh"], 36.0, places=1)
+
+    def test_parse_protobuf_player_state_returns_none_for_empty(self):
+        result = _parse_protobuf_player_state(b"")
+        self.assertIsNone(result)
+
+    def test_parse_protobuf_player_state_returns_none_when_no_meaningful_data(self):
+        # A blob with only zero-value fields should yield None
+        result = _parse_protobuf_player_state(b"\x00")  # unknown/empty
+        self.assertIsNone(result)
+
+
+class TestZwiftAPIClientProtobuf(unittest.TestCase):
+    """Tests for Content-Type handling and protobuf fallback in ZwiftAPIClient."""
+
+    def _make_client(self, access_token: str = "tok") -> ZwiftAPIClient:
+        auth = MagicMock(spec=ZwiftAuth)
+        auth.access_token = access_token
+        return ZwiftAPIClient(auth)
+
+    # -- get_player_state -----------------------------------------------------
+
+    @patch("zwift_api_polling.requests.Session.get")
+    def test_get_player_state_protobuf_response(self, mock_get):
+        """Binary protobuf response should be decoded into a usable dict."""
+        mock_get.return_value = _mock_binary_response(_SAMPLE_PLAYER_STATE_PROTO)
+        client = self._make_client()
+        state = client.get_player_state(world_id=1, rider_id=123)
+        self.assertIsNotNone(state)
+        self.assertEqual(state["power"], 250)
+        self.assertEqual(state["heartrate"], 160)
+        self.assertEqual(state["cadence"], 60)
+        self.assertAlmostEqual(state["speed_kmh"], 36.0, places=1)
+
+    @patch("zwift_api_polling.requests.Session.get")
+    def test_get_player_state_protobuf_empty_returns_none(self, mock_get):
+        """Empty binary response means rider not in world → None."""
+        mock_get.return_value = _mock_binary_response(b"")
+        client = self._make_client()
+        result = client.get_player_state(world_id=1, rider_id=123)
+        self.assertIsNone(result)
+
+    @patch("zwift_api_polling.requests.Session.get")
+    def test_get_player_state_json_decode_error_returns_none(self, mock_get):
+        """A JSON Content-Type response that fails to parse should return None."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"Content-Type": "application/json"}
+        resp.content = b"\x00\x01invalid"
+        resp.json.side_effect = json.JSONDecodeError("Expecting value", "", 0)
+        resp.raise_for_status.return_value = None
+        mock_get.return_value = resp
+        client = self._make_client()
+        result = client.get_player_state(world_id=1, rider_id=123)
+        self.assertIsNone(result)
+
+    @patch("zwift_api_polling.requests.Session.get")
+    def test_get_player_state_sends_accept_header(self, mock_get):
+        """Requests should carry Accept: application/json header."""
+        mock_get.return_value = _mock_json_response(
+            {"riderId": 1, "power": 100, "heartrate": 140, "cadence": 80, "speed": 30.0}
+        )
+        client = self._make_client()
+        client.get_player_state(world_id=1, rider_id=1)
+        _, kwargs = mock_get.call_args
+        headers = kwargs.get("headers", {})
+        self.assertEqual(headers.get("Accept"), "application/json")
+        self.assertEqual(headers.get("Zwift-Api-Version"), "2.6")
+
+    # -- get_active_world -----------------------------------------------------
+
+    @patch("zwift_api_polling.requests.Session.get")
+    def test_get_active_world_json_decode_error_tries_profile(self, mock_get):
+        """JSONDecodeError on activities should fall back to profile endpoint."""
+        activities_resp = MagicMock()
+        activities_resp.status_code = 200
+        activities_resp.headers = {"Content-Type": "application/json"}
+        activities_resp.content = b"\x00\x01invalid"
+        activities_resp.json.side_effect = json.JSONDecodeError("Expecting value", "", 0)
+        activities_resp.raise_for_status.return_value = None
+
+        profile_resp = _mock_json_response({"id": 123, "worldId": 5})
+
+        mock_get.side_effect = [activities_resp, profile_resp]
+        client = self._make_client()
+        world_id = client.get_active_world(rider_id=123)
+        self.assertEqual(world_id, 5)
+
+    @patch("zwift_api_polling.requests.Session.get")
+    def test_get_active_world_protobuf_response_tries_profile(self, mock_get):
+        """Binary activities response should fall back to profile endpoint."""
+        activities_resp = _mock_binary_response(b"\x08\x01")
+        profile_resp = _mock_json_response({"id": 123, "worldId": 2})
+
+        mock_get.side_effect = [activities_resp, profile_resp]
+        client = self._make_client()
+        world_id = client.get_active_world(rider_id=123)
+        self.assertEqual(world_id, 2)
+
+    @patch("zwift_api_polling.requests.Session.get")
+    def test_get_world_from_profile_returns_world_id(self, mock_get):
+        """_get_world_from_profile should parse worldId from profile JSON."""
+        activities_resp = _mock_json_response([], status_code=200)
+        profile_resp = _mock_json_response({"id": 456, "worldId": 7})
+        mock_get.side_effect = [activities_resp, profile_resp]
+        client = self._make_client()
+        world_id = client.get_active_world(rider_id=456)
+        self.assertEqual(world_id, 7)
+
+    @patch("zwift_api_polling.requests.Session.get")
+    def test_get_world_from_profile_returns_none_when_not_active(self, mock_get):
+        """Profile with no worldId should return None."""
+        activities_resp = _mock_json_response([], status_code=200)
+        profile_resp = _mock_json_response({"id": 456})
+        mock_get.side_effect = [activities_resp, profile_resp]
+        client = self._make_client()
+        result = client.get_active_world(rider_id=456)
+        self.assertIsNone(result)
+
+    @patch("zwift_api_polling.requests.Session.get")
+    def test_get_world_from_profile_handles_non_json_response(self, mock_get):
+        """Non-JSON profile response should return None gracefully."""
+        activities_resp = _mock_json_response([], status_code=200)
+        profile_resp = _mock_binary_response(b"\x08\x01")
+        mock_get.side_effect = [activities_resp, profile_resp]
+        client = self._make_client()
+        result = client.get_active_world(rider_id=456)
+        self.assertIsNone(result)
 
 
 # ---------------------------------------------------------------------------

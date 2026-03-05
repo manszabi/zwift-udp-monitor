@@ -18,6 +18,7 @@ import getpass
 import json
 import os
 import socket
+import struct
 import sys
 import time
 import threading
@@ -45,6 +46,119 @@ TOKEN_REFRESH_BUFFER = 30  # seconds
 
 # Back-off for rate-limit (429) responses
 RATE_LIMIT_BACKOFF = 5.0  # seconds
+
+# Unit conversion factors (same as zwift_udp_monitor.py)
+_MICROHERTZ_TO_RPM = 60 / 1_000_000   # cadenceUHz: µHz → RPM
+_MM_PER_HOUR_TO_KM_PER_HOUR = 1 / 1_000_000  # speed: mm/h → km/h
+
+# ---------------------------------------------------------------------------
+# ProtobufDecoder – raw varint / field parser (no .proto compilation needed)
+# Relay API endpoints return binary protobuf; this decoder handles wire types
+# 0 (varint), 1 (64-bit fixed), 2 (length-delimited), and 5 (32-bit fixed).
+# ---------------------------------------------------------------------------
+
+
+class ProtobufDecoder:
+    """Minimal protobuf decoder supporting wire types 0, 1, 2, and 5."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+        self._pos = 0
+
+    def _read_varint(self):
+        result = 0
+        shift = 0
+        while self._pos < len(self._data):
+            byte = self._data[self._pos]
+            self._pos += 1
+            result |= (byte & 0x7F) << shift
+            if not (byte & 0x80):
+                return result
+            shift += 7
+        raise ValueError("Truncated varint")
+
+    def _read_bytes(self, n: int) -> bytes:
+        if self._pos + n > len(self._data):
+            raise ValueError(
+                f"Not enough data: need {n}, have {len(self._data) - self._pos}"
+            )
+        chunk = self._data[self._pos : self._pos + n]
+        self._pos += n
+        return chunk
+
+    def fields(self):
+        """Yield (field_number, wire_type, value) tuples."""
+        while self._pos < len(self._data):
+            tag = self._read_varint()
+            field_number = tag >> 3
+            wire_type = tag & 0x07
+            if wire_type == 0:
+                value = self._read_varint()
+            elif wire_type == 1:
+                value = self._read_bytes(8)
+            elif wire_type == 2:
+                length = self._read_varint()
+                value = self._read_bytes(length)
+            elif wire_type == 5:
+                value = self._read_bytes(4)
+            else:
+                break
+            yield field_number, wire_type, value
+
+    @classmethod
+    def parse_fields(cls, data: bytes) -> dict:
+        """Return {field_number: value} keeping the last value per field."""
+        result = {}
+        try:
+            for field_number, _wt, value in cls(data).fields():
+                result[field_number] = value
+        except (ValueError, struct.error):
+            pass
+        return result
+
+
+# PlayerState protobuf field numbers (from zwift_messages.proto)
+_PS_FIELD_ID = 1
+_PS_FIELD_SPEED = 6
+_PS_FIELD_CADENCE_UHZ = 9
+_PS_FIELD_HEARTRATE = 11
+_PS_FIELD_POWER = 12
+
+
+def _proto_to_int(value: int | bytes | None, default: int = 0) -> int:
+    """Convert a protobuf field value (varint or fixed bytes) to int."""
+    if isinstance(value, int):
+        return value
+    if isinstance(value, bytes):
+        if len(value) == 4:
+            return struct.unpack("<I", value)[0]
+        if len(value) == 8:
+            return struct.unpack("<Q", value)[0]
+    return default
+
+
+def _parse_protobuf_player_state(data: bytes) -> dict | None:
+    """Decode a raw PlayerState protobuf blob into a ZwiftDataStore-compatible dict.
+
+    Returns *None* if the blob contains no meaningful data (all zeros).
+    """
+    fields = ProtobufDecoder.parse_fields(data)
+    if not fields:
+        return None
+    speed_mmh = _proto_to_int(fields.get(_PS_FIELD_SPEED, 0))
+    cadence_uhz = _proto_to_int(fields.get(_PS_FIELD_CADENCE_UHZ, 0))
+    state = {
+        "riderId": _proto_to_int(fields.get(_PS_FIELD_ID, 0)),
+        "power": _proto_to_int(fields.get(_PS_FIELD_POWER, 0)),
+        "heartrate": _proto_to_int(fields.get(_PS_FIELD_HEARTRATE, 0)),
+        "cadence": round(cadence_uhz * _MICROHERTZ_TO_RPM) if cadence_uhz else 0,
+        "speed_kmh": round(speed_mmh * _MM_PER_HOUR_TO_KM_PER_HOUR, 1) if speed_mmh else 0.0,
+    }
+    # Return None when riderId is zero; an active rider always has a valid ID
+    if not state["riderId"]:
+        return None
+    return state
+
 
 # ---------------------------------------------------------------------------
 # ZwiftAuth – OAuth2 token lifecycle
@@ -136,7 +250,11 @@ class ZwiftAPIClient:
         self._session = requests.Session()
 
     def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self._auth.access_token}"}
+        return {
+            "Authorization": f"Bearer {self._auth.access_token}",
+            "Accept": "application/json",
+            "Zwift-Api-Version": "2.6",
+        }
 
     def get_profile(self) -> dict:
         """Return the authenticated user's profile (contains ``id``)."""
@@ -150,6 +268,8 @@ class ZwiftAPIClient:
 
         Tries the relay/worlds endpoint which returns real-time data.
         Falls back gracefully when the player is not in a world.
+        The endpoint may return JSON or binary protobuf depending on the API
+        version; both cases are handled transparently.
         """
         url = f"{ZWIFT_API_BASE}/relay/worlds/{world_id}/players/{rider_id}"
         resp = self._session.get(url, headers=self._headers(), timeout=10)
@@ -158,13 +278,36 @@ class ZwiftAPIClient:
         if resp.status_code == 429:
             raise RateLimitError("Rate limited (429)")
         resp.raise_for_status()
-        return resp.json()
+
+        content_type = resp.headers.get("Content-Type", "")
+        if "application/json" in content_type:
+            try:
+                return resp.json()
+            except json.JSONDecodeError as exc:
+                if self._debug:
+                    print(
+                        f"\n[DEBUG] JSON decode error on player state: {exc}"
+                        f"\n[DEBUG] Content-Type: {content_type}"
+                        f"\n[DEBUG] Response bytes[:64]: {resp.content[:64]!r}"
+                    )
+                return None
+        else:
+            # Binary / protobuf response from relay endpoint
+            if self._debug:
+                print(
+                    f"\n[DEBUG] Non-JSON player state response"
+                    f"\n[DEBUG] Content-Type: {content_type!r}"
+                    f"\n[DEBUG] Response bytes[:64]: {resp.content[:64]!r}"
+                )
+            return _parse_protobuf_player_state(resp.content)
 
     def get_active_world(self, rider_id: int) -> int | None:
         """Try to determine the world the rider is currently in (1=Watopia etc.).
 
         Queries the activities endpoint; returns the worldId of the most recent
         in-progress activity, or *None* if the rider is not online.
+        Falls back to the profile endpoint when the activities response is not
+        valid JSON (e.g. protobuf) or contains no worldId.
         """
         url = f"{ZWIFT_API_BASE}/api/profiles/{rider_id}/activities"
         params = {"limit": 1}
@@ -176,11 +319,58 @@ class ZwiftAPIClient:
         if resp.status_code == 429:
             raise RateLimitError("Rate limited (429)")
         resp.raise_for_status()
-        activities = resp.json()
-        if not activities:
+
+        content_type = resp.headers.get("Content-Type", "")
+        activities = None
+        if "application/json" in content_type:
+            try:
+                activities = resp.json()
+            except json.JSONDecodeError as exc:
+                if self._debug:
+                    print(
+                        f"\n[DEBUG] JSON decode error on activities: {exc}"
+                        f"\n[DEBUG] Content-Type: {content_type}"
+                        f"\n[DEBUG] Response bytes[:64]: {resp.content[:64]!r}"
+                    )
+        else:
+            if self._debug:
+                print(
+                    f"\n[DEBUG] Non-JSON activities response"
+                    f"\n[DEBUG] Content-Type: {content_type!r}"
+                    f"\n[DEBUG] Response bytes[:64]: {resp.content[:64]!r}"
+                )
+
+        if activities:
+            latest = activities[0] if isinstance(activities, list) else activities
+            world_id = latest.get("worldId") or latest.get("world_id")
+            if world_id:
+                return world_id
+
+        # Fallback: try the profile endpoint which may carry a current worldId
+        return self._get_world_from_profile(rider_id)
+
+    def _get_world_from_profile(self, rider_id: int) -> int | None:
+        """Return the worldId from the rider's profile endpoint, or *None*."""
+        url = f"{ZWIFT_API_BASE}/api/profiles/{rider_id}"
+        try:
+            resp = self._session.get(url, headers=self._headers(), timeout=10)
+            if resp.status_code != 200:
+                return None
+            content_type = resp.headers.get("Content-Type", "")
+            if "application/json" not in content_type:
+                if self._debug:
+                    print(
+                        f"\n[DEBUG] Non-JSON profile response"
+                        f"\n[DEBUG] Content-Type: {content_type!r}"
+                        f"\n[DEBUG] Response bytes[:64]: {resp.content[:64]!r}"
+                    )
+                return None
+            profile = resp.json()
+            if not isinstance(profile, dict):
+                return None
+            return profile.get("worldId") or profile.get("world_id") or None
+        except (json.JSONDecodeError, requests.RequestException):
             return None
-        latest = activities[0] if isinstance(activities, list) else activities
-        return latest.get("worldId") or latest.get("world_id")
 
     def close(self) -> None:
         self._session.close()
