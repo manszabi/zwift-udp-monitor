@@ -8,6 +8,7 @@ Must be run as Administrator (Npcap requires elevated privileges).
 
 from __future__ import annotations
 
+import argparse
 import json
 import socket
 import struct
@@ -184,39 +185,81 @@ class ZwiftPacketParser:
         )
         return [self.parse_player_state(blob) for blob in player_state_blobs]
 
+    @staticmethod
+    def _state_has_data(state: dict | None) -> bool:
+        """Return True if the state dict has at least one non-zero meaningful field."""
+        if not state:
+            return False
+        return bool(state.get("rider_id") or state.get("power") or state.get("heartrate"))
+
     def parse_outgoing(self, raw_data: bytes) -> dict | None:
         """Parse a ClientToServer packet (our own rider data).
 
-        Applies the header-skip logic from zwifty-packets:
+        Tries multiple header-skip strategies and fallback parse approaches for
+        resilience across different Zwift versions and packet formats.
+
+        Primary strategies (original header-skip heuristics):
           - data[0] == 0x08 → no skip
           - data[5] == 0x08 → skip first 5 bytes
           - otherwise       → skip data[0] - 1 bytes
-        Trims the last 4 bytes (checksum/trailer) before decoding.
+        Each candidate payload is trimmed of the last 4 bytes (checksum/trailer)
+        and then decoded as a ClientToServer wrapper (trying field numbers 7, 6, 8, 5).
+
+        Fallback strategies (if no result with useful data found):
+          - Parse trimmed payload directly as a PlayerState (no wrapper)
         """
         if len(raw_data) < 6:
             return None
 
+        # Build candidate payloads from all skip heuristics, preserving order
+        candidates: list[bytes] = []
         if raw_data[0] == 0x08:
-            payload = raw_data
-        elif len(raw_data) > 5 and raw_data[5] == 0x08:
-            payload = raw_data[5:]
-        else:
-            skip = raw_data[0] - 1
-            if skip < 0 or skip >= len(raw_data):
-                return None
-            payload = raw_data[skip:]
+            candidates.append(raw_data)
+        if len(raw_data) > 5 and raw_data[5] == 0x08:
+            p = raw_data[5:]
+            if p not in candidates:
+                candidates.append(p)
+        skip = raw_data[0] - 1
+        if 0 <= skip < len(raw_data):
+            p = raw_data[skip:]
+            if p not in candidates:
+                candidates.append(p)
+        # Always include the raw payload as a last-resort candidate
+        if raw_data not in candidates:
+            candidates.append(raw_data)
 
-        # Trim last 4 bytes (checksum/trailer)
-        if len(payload) <= 4:
-            return None
-        payload = payload[:-4]
+        fallbacks: list[dict] = []
 
-        # The ClientToServer wrapper has the PlayerState at field 7
-        fields = ProtobufDecoder.parse_fields(payload)
-        state_blob = fields.get(self._C2S_STATE_FIELD)
-        if not isinstance(state_blob, bytes):
-            return None
-        return self.parse_player_state(state_blob)
+        for payload in candidates:
+            if len(payload) <= 4:
+                continue
+            trimmed = payload[:-4]
+
+            # Try C2S wrapper field numbers.
+            # Field 7 is the standard ClientToServer PlayerState field; fields 5, 6, 8
+            # are observed in alternative Zwift packet layouts (different app versions
+            # or protocol variants may embed the PlayerState at a different field number).
+            fields = ProtobufDecoder.parse_fields(trimmed)
+            for field_num in (self._C2S_STATE_FIELD, 6, 8, 5):
+                state_blob = fields.get(field_num)
+                if isinstance(state_blob, bytes) and len(state_blob) >= 2:
+                    state = self.parse_player_state(state_blob)
+                    if self._state_has_data(state):
+                        return state
+                    fallbacks.append(state)
+
+            # Try parsing trimmed payload directly as a PlayerState (no wrapper)
+            state = self.parse_player_state(trimmed)
+            if self._state_has_data(state):
+                return state
+            if state:
+                fallbacks.append(state)
+
+        # Return the first fallback that at least has a non-zero rider_id
+        for s in fallbacks:
+            if s.get("rider_id", 0) != 0:
+                return s
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -409,9 +452,12 @@ def run_capture(
     device: str,
     store: ZwiftDataStore,
     stop_event: threading.Event,
+    *,
+    debug: bool = False,
 ) -> None:
     """Open a pcapy capture on *device* and decode Zwift UDP packets."""
     parser = ZwiftPacketParser()
+    parse_errors = 0
 
     try:
         cap = pcapy.open_live(device, 65536, True, 1000)
@@ -438,23 +484,47 @@ def run_capture(
             continue
         src_port, dst_port, udp_payload = parsed
 
+        if debug:
+            direction = "S→C" if src_port == ZWIFT_UDP_PORT else "C→S"
+            print(
+                f"\n[DEBUG] {direction} {len(udp_payload)}B "
+                f"src={src_port} dst={dst_port} "
+                f"hex={udp_payload[:32].hex()}"
+            )
+
         try:
             if src_port == ZWIFT_UDP_PORT:
-                # ServerToClient – contains other riders as well; only update our own
+                # ServerToClient – contains multiple riders
                 states = parser.parse_incoming(udp_payload)
                 my_rider_id = store.rider_id
-                if my_rider_id != 0:
+                if my_rider_id == 0:
+                    # Bootstrap: accept the first state with a valid rider_id so the
+                    # display works while we wait for a successful outgoing parse
+                    for state in states:
+                        if state.get("rider_id", 0) != 0:
+                            store.update(state)
+                            break
+                else:
                     for state in states:
                         if state.get("rider_id") == my_rider_id:
                             store.update(state)
+
+                if debug:
+                    print(f"[DEBUG] S→C: parsed {len(states)} state(s), store.rider_id={store.rider_id}")
 
             elif dst_port == ZWIFT_UDP_PORT:
                 # ClientToServer – our own rider (primary data source)
                 state = parser.parse_outgoing(udp_payload)
                 if state:
                     store.update(state)
-        except Exception:
-            pass
+
+                if debug:
+                    print(f"[DEBUG] C→S: parsed {state!r}")
+
+        except Exception as exc:
+            parse_errors += 1
+            if debug or parse_errors <= 3:
+                print(f"[WARN] parse error #{parse_errors}: {exc!r}")
 
 def ensure_admin() -> None:
     """Ensure the script is running with Administrator privileges on Windows.
@@ -497,6 +567,14 @@ def ensure_admin() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    arg_parser = argparse.ArgumentParser(description=f"Zwift UDP Monitor v{__version__}")
+    arg_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose packet logging (direction, size, hex dump, parse results)",
+    )
+    args = arg_parser.parse_args()
+
     ensure_admin()
     try:
         print("=" * 60)
@@ -518,7 +596,7 @@ def main() -> None:
         broadcast_thread.start()
 
         try:
-            run_capture(device, store, stop_event)
+            run_capture(device, store, stop_event, debug=args.debug)
         except KeyboardInterrupt:
             print("\n\nLeállítás… / Stopping…")
         finally:
