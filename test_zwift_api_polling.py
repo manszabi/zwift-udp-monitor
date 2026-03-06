@@ -13,7 +13,14 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch, PropertyMock
 
+import os
+import tempfile
+
 from zwift_api_polling import (
+    BROADCAST_HOST,
+    BROADCAST_PORT,
+    DEFAULT_POLL_INTERVAL,
+    SETTINGS_FILE,
     RateLimitError,
     UDPBroadcaster,
     ZwiftAPIClient,
@@ -22,6 +29,8 @@ from zwift_api_polling import (
     ProtobufDecoder,
     _parse_protobuf_player_state,
     _sleep_remainder,
+    load_settings,
+    save_settings,
     resolve_credentials,
     build_arg_parser,
 )
@@ -602,6 +611,164 @@ class TestSleepRemainder(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# load_settings / save_settings tests
+# ---------------------------------------------------------------------------
+
+
+class TestLoadSettings(unittest.TestCase):
+    def test_load_settings_file_not_found(self):
+        """Non-existent path returns default values."""
+        result = load_settings("/nonexistent/path/settings.json")
+        self.assertEqual(result["username"], "")
+        self.assertEqual(result["password"], "")
+        self.assertEqual(result["broadcast_host"], BROADCAST_HOST)
+        self.assertEqual(result["broadcast_port"], BROADCAST_PORT)
+        self.assertEqual(result["poll_interval"], DEFAULT_POLL_INTERVAL)
+
+    def test_load_settings_valid_json(self):
+        """All fields are read from a valid JSON file."""
+        data = {
+            "username": "user@example.com",
+            "password": "s3cr3t",
+            "broadcast_host": "192.168.1.100",
+            "broadcast_port": 8080,
+            "poll_interval": 2.5,
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as tmp:
+            json.dump(data, tmp)
+            tmp_path = tmp.name
+        try:
+            result = load_settings(tmp_path)
+            self.assertEqual(result["username"], "user@example.com")
+            self.assertEqual(result["password"], "s3cr3t")
+            self.assertEqual(result["broadcast_host"], "192.168.1.100")
+            self.assertEqual(result["broadcast_port"], 8080)
+            self.assertAlmostEqual(result["poll_interval"], 2.5)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_load_settings_invalid_json(self):
+        """Invalid JSON triggers a warning and returns defaults."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as tmp:
+            tmp.write("not valid json{{{")
+            tmp_path = tmp.name
+        try:
+            with patch("builtins.print") as mock_print:
+                result = load_settings(tmp_path)
+            mock_print.assert_called_once()
+            self.assertEqual(result["broadcast_host"], BROADCAST_HOST)
+            self.assertEqual(result["broadcast_port"], BROADCAST_PORT)
+            self.assertEqual(result["poll_interval"], DEFAULT_POLL_INTERVAL)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_load_settings_missing_keys(self):
+        """Missing keys are filled with defaults."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as tmp:
+            json.dump({"username": "only_user"}, tmp)
+            tmp_path = tmp.name
+        try:
+            result = load_settings(tmp_path)
+            self.assertEqual(result["username"], "only_user")
+            self.assertEqual(result["password"], "")
+            self.assertEqual(result["broadcast_host"], BROADCAST_HOST)
+            self.assertEqual(result["broadcast_port"], BROADCAST_PORT)
+            self.assertEqual(result["poll_interval"], DEFAULT_POLL_INTERVAL)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_load_settings_wrong_types(self):
+        """Wrong-typed values are replaced with defaults and a warning is printed."""
+        data = {
+            "username": 12345,          # should be str
+            "broadcast_host": "",       # should be non-empty str
+            "broadcast_port": "8080",   # should be int
+            "poll_interval": "fast",    # should be number
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as tmp:
+            json.dump(data, tmp)
+            tmp_path = tmp.name
+        try:
+            with patch("builtins.print") as mock_print:
+                result = load_settings(tmp_path)
+            self.assertGreater(mock_print.call_count, 0)
+            self.assertEqual(result["username"], "")         # default
+            self.assertEqual(result["broadcast_host"], BROADCAST_HOST)   # default
+            self.assertEqual(result["broadcast_port"], BROADCAST_PORT)   # default
+            self.assertEqual(result["poll_interval"], DEFAULT_POLL_INTERVAL)  # default
+        finally:
+            os.unlink(tmp_path)
+
+    def test_load_settings_port_out_of_range(self):
+        """Port outside 1-65535 is replaced with default."""
+        data = {"broadcast_port": 70000}
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as tmp:
+            json.dump(data, tmp)
+            tmp_path = tmp.name
+        try:
+            with patch("builtins.print"):
+                result = load_settings(tmp_path)
+            self.assertEqual(result["broadcast_port"], BROADCAST_PORT)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_load_settings_negative_poll_interval(self):
+        """Negative poll_interval is replaced with default."""
+        data = {"poll_interval": -1.0}
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as tmp:
+            json.dump(data, tmp)
+            tmp_path = tmp.name
+        try:
+            with patch("builtins.print"):
+                result = load_settings(tmp_path)
+            self.assertEqual(result["poll_interval"], DEFAULT_POLL_INTERVAL)
+        finally:
+            os.unlink(tmp_path)
+
+
+class TestSaveSettings(unittest.TestCase):
+    def test_save_settings_creates_file(self):
+        """save_settings creates the file if it doesn't exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "settings.json")
+            save_settings(path, {"username": "u", "password": "p"})
+            self.assertTrue(os.path.exists(path))
+
+    def test_save_settings_content_is_valid_json(self):
+        """The saved file contains valid JSON with the expected content."""
+        data = {
+            "username": "user@example.com",
+            "password": "secret",
+            "broadcast_host": "127.0.0.1",
+            "broadcast_port": 7878,
+            "poll_interval": 5.0,
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as tmp:
+            tmp_path = tmp.name
+        try:
+            save_settings(tmp_path, data)
+            with open(tmp_path) as fh:
+                loaded = json.load(fh)
+            self.assertEqual(loaded, data)
+        finally:
+            os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # Credential resolution tests
 # ---------------------------------------------------------------------------
 
@@ -643,9 +810,77 @@ class TestResolveCredentials(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             with patch("builtins.input", return_value="prompt_user"):
                 with patch("getpass.getpass", return_value="prompt_pass"):
-                    user, pw = resolve_credentials(args)
+                    # settings_path=None means no saving
+                    user, pw = resolve_credentials(args, settings={}, settings_path=None)
         self.assertEqual(user, "prompt_user")
         self.assertEqual(pw, "prompt_pass")
+
+    def test_from_settings_file(self):
+        """If neither CLI nor env provides credentials, read from settings dict."""
+        parser = build_arg_parser()
+        args = parser.parse_args([])
+        settings = {"username": "json_user", "password": "json_pass"}
+        with patch.dict("os.environ", {}, clear=True):
+            user, pw = resolve_credentials(args, settings=settings)
+        self.assertEqual(user, "json_user")
+        self.assertEqual(pw, "json_pass")
+
+    def test_cli_takes_priority_over_settings(self):
+        """CLI args take precedence over settings file."""
+        parser = build_arg_parser()
+        args = parser.parse_args(["--username", "cli_user", "--password", "cli_pass"])
+        settings = {"username": "json_user", "password": "json_pass"}
+        with patch.dict("os.environ", {}, clear=True):
+            user, pw = resolve_credentials(args, settings=settings)
+        self.assertEqual(user, "cli_user")
+        self.assertEqual(pw, "cli_pass")
+
+    def test_env_takes_priority_over_settings(self):
+        """Environment variables take precedence over settings file."""
+        parser = build_arg_parser()
+        args = parser.parse_args([])
+        settings = {"username": "json_user", "password": "json_pass"}
+        env = {"ZWIFT_USERNAME": "env_user", "ZWIFT_PASSWORD": "env_pass"}
+        with patch.dict("os.environ", env):
+            user, pw = resolve_credentials(args, settings=settings)
+        self.assertEqual(user, "env_user")
+        self.assertEqual(pw, "env_pass")
+
+    def test_saves_settings_after_prompt(self):
+        """When credentials are entered via prompt, settings are saved to file."""
+        parser = build_arg_parser()
+        args = parser.parse_args([])
+        settings = {
+            "username": "",
+            "password": "",
+            "broadcast_host": BROADCAST_HOST,
+            "broadcast_port": BROADCAST_PORT,
+            "poll_interval": DEFAULT_POLL_INTERVAL,
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as tmp:
+            tmp_path = tmp.name
+        os.unlink(tmp_path)  # remove so save creates it fresh
+
+        try:
+            with patch.dict("os.environ", {}, clear=True):
+                with patch("builtins.input", return_value="prompt_user"):
+                    with patch("getpass.getpass", return_value="prompt_pass"):
+                        with patch("builtins.print"):
+                            user, pw = resolve_credentials(
+                                args, settings=settings, settings_path=tmp_path
+                            )
+            self.assertEqual(user, "prompt_user")
+            self.assertEqual(pw, "prompt_pass")
+            self.assertTrue(os.path.exists(tmp_path))
+            with open(tmp_path) as fh:
+                saved = json.load(fh)
+            self.assertEqual(saved["username"], "prompt_user")
+            self.assertEqual(saved["password"], "prompt_pass")
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -659,8 +894,9 @@ class TestArgParser(unittest.TestCase):
         args = parser.parse_args([])
         self.assertEqual(args.username, "")
         self.assertEqual(args.password, "")
-        self.assertEqual(args.poll_interval, 1.0)
+        self.assertIsNone(args.poll_interval)
         self.assertFalse(args.debug)
+        self.assertFalse(args.no_fan_controller)
 
     def test_custom_poll_interval(self):
         parser = build_arg_parser()
@@ -671,6 +907,11 @@ class TestArgParser(unittest.TestCase):
         parser = build_arg_parser()
         args = parser.parse_args(["--debug"])
         self.assertTrue(args.debug)
+
+    def test_no_fan_controller_flag(self):
+        parser = build_arg_parser()
+        args = parser.parse_args(["--no-fan-controller"])
+        self.assertTrue(args.no_fan_controller)
 
 
 # ---------------------------------------------------------------------------
