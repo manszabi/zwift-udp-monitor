@@ -7,8 +7,8 @@ works with this script interchangeably with zwift_udp_monitor.py.
 Credential handling (in priority order):
   1. --username / --password CLI flags
   2. ZWIFT_USERNAME / ZWIFT_PASSWORD environment variables
-  3. Interactive prompt
-Credentials and tokens are NEVER written to disk.
+  3. zwift_api_settings.json file
+  4. Interactive prompt (saved to zwift_api_settings.json if used)
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import sys
 import time
 import threading
@@ -34,6 +35,9 @@ __version__ = "1.0.0"
 BROADCAST_HOST = "127.0.0.1"
 BROADCAST_PORT = 7878
 DEFAULT_POLL_INTERVAL = 5.0  # seconds
+
+# Settings file – resolved relative to this script's directory
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zwift_api_settings.json")
 
 ZWIFT_AUTH_URL = (
     "https://secure.zwift.com/auth/realms/zwift/protocol/openid-connect/token"
@@ -568,24 +572,134 @@ def _sleep_remainder(loop_start: float, interval: float, stop_event: threading.E
 
 
 # ---------------------------------------------------------------------------
+# Settings persistence
+# ---------------------------------------------------------------------------
+
+
+def load_settings(path: str) -> dict:
+    """Load settings from a JSON file.
+
+    Returns a dict with keys: username, password, broadcast_host,
+    broadcast_port, poll_interval.  Missing or invalid values are replaced
+    with defaults and a warning is printed.
+    """
+    defaults = {
+        "username": "",
+        "password": "",
+        "broadcast_host": BROADCAST_HOST,
+        "broadcast_port": BROADCAST_PORT,
+        "poll_interval": DEFAULT_POLL_INTERVAL,
+    }
+
+    if not os.path.exists(path):
+        return dict(defaults)
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except json.JSONDecodeError:
+        print(f"⚠️  Érvénytelen JSON a beállításfájlban / Invalid JSON in settings file: {path}")
+        return dict(defaults)
+
+    settings = dict(defaults)
+
+    # username
+    if "username" in raw:
+        if isinstance(raw["username"], str):
+            settings["username"] = raw["username"]
+        else:
+            print("⚠️  Érvénytelen 'username' a beállításfájlban (string szükséges) / Invalid 'username' in settings (must be string)")
+
+    # password
+    if "password" in raw:
+        if isinstance(raw["password"], str):
+            settings["password"] = raw["password"]
+        else:
+            print("⚠️  Érvénytelen 'password' a beállításfájlban (string szükséges) / Invalid 'password' in settings (must be string)")
+
+    # broadcast_host
+    if "broadcast_host" in raw:
+        if isinstance(raw["broadcast_host"], str) and raw["broadcast_host"]:
+            settings["broadcast_host"] = raw["broadcast_host"]
+        else:
+            print("⚠️  Érvénytelen 'broadcast_host' a beállításfájlban (nem üres string szükséges) / Invalid 'broadcast_host' in settings (must be non-empty string)")
+
+    # broadcast_port
+    if "broadcast_port" in raw:
+        val = raw["broadcast_port"]
+        if isinstance(val, int) and not isinstance(val, bool) and 1 <= val <= 65535:
+            settings["broadcast_port"] = val
+        else:
+            print("⚠️  Érvénytelen 'broadcast_port' a beállításfájlban (1-65535 közötti int szükséges) / Invalid 'broadcast_port' in settings (must be int in range 1-65535)")
+
+    # poll_interval
+    if "poll_interval" in raw:
+        val = raw["poll_interval"]
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+            settings["poll_interval"] = float(val)
+        else:
+            print("⚠️  Érvénytelen 'poll_interval' a beállításfájlban (pozitív szám szükséges) / Invalid 'poll_interval' in settings (must be positive number)")
+
+    return settings
+
+
+def save_settings(path: str, settings_dict: dict) -> None:
+    """Save settings to a JSON file with pretty formatting."""
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(settings_dict, fh, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # Credential resolution
 # ---------------------------------------------------------------------------
 
 
-def resolve_credentials(args: argparse.Namespace) -> tuple[str, str]:
-    """Return (username, password) from CLI args, env vars, or prompt."""
+def resolve_credentials(
+    args: argparse.Namespace,
+    settings: dict | None = None,
+    settings_path: str | None = None,
+) -> tuple[str, str]:
+    """Return (username, password) from CLI args, env vars, settings file, or prompt.
+
+    Priority:
+      1. CLI args (--username / --password)
+      2. Environment variables (ZWIFT_USERNAME / ZWIFT_PASSWORD)
+      3. settings dict (loaded from zwift_api_settings.json)
+      4. Interactive prompt (result saved to settings_path if provided)
+    """
+    if settings is None:
+        settings = {}
+
     username = (
         args.username
         or os.environ.get("ZWIFT_USERNAME", "")
+        or settings.get("username", "")
     )
     password = (
         args.password
         or os.environ.get("ZWIFT_PASSWORD", "")
+        or settings.get("password", "")
     )
+
+    from_prompt = False
     if not username:
         username = input("Zwift felhasználónév / Username: ").strip()
+        from_prompt = True
     if not password:
         password = getpass.getpass("Zwift jelszó / Password: ")
+        from_prompt = True
+
+    if from_prompt and settings_path:
+        to_save = {
+            "username": username,
+            "password": password,
+            "broadcast_host": settings.get("broadcast_host", BROADCAST_HOST),
+            "broadcast_port": settings.get("broadcast_port", BROADCAST_PORT),
+            "poll_interval": settings.get("poll_interval", DEFAULT_POLL_INTERVAL),
+        }
+        save_settings(settings_path, to_save)
+        print(f"✅ Beállítások mentve / Settings saved to {settings_path}")
+
     return username, password
 
 
@@ -606,14 +720,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--poll-interval",
         type=float,
-        default=DEFAULT_POLL_INTERVAL,
+        default=None,
         metavar="SECONDS",
-        help=f"Polling interval in seconds (default: {DEFAULT_POLL_INTERVAL})",
+        help=f"Polling interval in seconds (default: from settings or {DEFAULT_POLL_INTERVAL})",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable verbose debug output",
+    )
+    parser.add_argument(
+        "--no-fan-controller",
+        action="store_true",
+        help="Do not automatically start smart_fan_controller.py",
     )
     return parser
 
@@ -627,7 +746,13 @@ def main(argv: list[str] | None = None) -> int:
     print(" HTTPS API lekérdezés + UDP broadcast (127.0.0.1:7878)")
     print("=" * 60)
 
-    username, password = resolve_credentials(args)
+    # Load settings from JSON file (if it exists)
+    settings = load_settings(SETTINGS_FILE)
+
+    # Resolve poll interval: CLI > settings > hard-coded default
+    poll_interval = args.poll_interval if args.poll_interval is not None else settings["poll_interval"]
+
+    username, password = resolve_credentials(args, settings=settings, settings_path=SETTINGS_FILE)
 
     auth = ZwiftAuth(username, password, debug=args.debug)
     print("\nBejelentkezés folyamatban / Logging in …")
@@ -657,13 +782,29 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"✅ Rider ID: {rider_id}")
     print(
-        f"🔄 Lekérdezési intervallum / Poll interval: {args.poll_interval}s\n"
+        f"🔄 Lekérdezési intervallum / Poll interval: {poll_interval}s\n"
         "Press Ctrl+C to stop.\n"
     )
 
     store = ZwiftDataStore()
-    broadcaster = UDPBroadcaster()
+    broadcaster = UDPBroadcaster(
+        host=settings["broadcast_host"],
+        port=settings["broadcast_port"],
+    )
     stop_event = threading.Event()
+
+    # Start smart_fan_controller.py if it exists and --no-fan-controller is not set
+    fan_controller_proc: subprocess.Popen[bytes] | None = None
+    if not args.no_fan_controller:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        fan_controller_path = os.path.join(script_dir, "smart_fan_controller.py")
+        if os.path.exists(fan_controller_path):
+            fan_controller_proc = subprocess.Popen(
+                [sys.executable, fan_controller_path],
+            )
+            print(f"🚀 smart_fan_controller.py elindítva / started (PID {fan_controller_proc.pid})")
+        else:
+            print("⚠️  smart_fan_controller.py nem található / not found – skipping auto-start")
 
     try:
         run_polling_loop(
@@ -673,7 +814,7 @@ def main(argv: list[str] | None = None) -> int:
             broadcaster,
             stop_event,
             rider_id,
-            poll_interval=args.poll_interval,
+            poll_interval=poll_interval,
             debug=args.debug,
         )
     except KeyboardInterrupt:
@@ -682,6 +823,12 @@ def main(argv: list[str] | None = None) -> int:
         stop_event.set()
         broadcaster.close()
         client.close()
+        if fan_controller_proc is not None and fan_controller_proc.poll() is None:
+            fan_controller_proc.terminate()
+            try:
+                fan_controller_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                fan_controller_proc.kill()
 
     return 0
 
