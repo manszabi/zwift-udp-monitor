@@ -1,0 +1,8 @@
+{
+  "zca_udp_port": 21587,
+  "broadcast_host": "127.0.0.1",
+  "broadcast_port": 7878,
+  "broadcast_interval": 1.0,
+  "microhertz_to_hertz": 1000000,
+  "mm_per_hour_to_km_per_hour": 1000000
+}

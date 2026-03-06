@@ -5,9 +5,12 @@ Uses unittest (consistent with the smart-fan-controller project).
 No external dependencies required – the module no longer uses pcapy.
 """
 
+import json
+import os
 import socket
 import struct
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -17,7 +20,10 @@ from zwift_udp_monitor import (  # noqa: E402
     ZCA_UDP_PORT,
     ZwiftDataStore,
     ZwiftPacketParser,
+    _DEFAULT_SETTINGS,
+    load_settings,
     run_listener,
+    save_settings,
 )
 
 # ---------------------------------------------------------------------------
@@ -888,6 +894,167 @@ class TestRunListenerDebugAndSocket(unittest.TestCase):
                 run_listener(self.store, stop_event)
 
         self.assertIn("21587", str(ctx.exception))
+
+
+# ===========================================================================
+# 7. Settings loading / validation / auto-creation tests
+# ===========================================================================
+
+
+class TestLoadSettings(unittest.TestCase):
+    """Tests for load_settings() and save_settings()."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.settings_path = os.path.join(self.tmp.name, "zwift_udp_monitor_setting.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    # ---- file creation ----
+
+    def test_creates_file_with_defaults_when_missing(self):
+        """If the file does not exist it is created and defaults are returned."""
+        result = load_settings(self.settings_path)
+        self.assertEqual(result, _DEFAULT_SETTINGS)
+        self.assertTrue(os.path.exists(self.settings_path))
+
+    def test_created_file_is_valid_json(self):
+        """The auto-created file must be parseable JSON."""
+        load_settings(self.settings_path)
+        with open(self.settings_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertIsInstance(data, dict)
+
+    def test_recreates_file_on_invalid_json(self):
+        """A corrupt settings file is overwritten with defaults."""
+        with open(self.settings_path, "w", encoding="utf-8") as fh:
+            fh.write("this is not json {{{")
+        result = load_settings(self.settings_path)
+        self.assertEqual(result, _DEFAULT_SETTINGS)
+        # The file must now contain valid JSON defaults
+        with open(self.settings_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual(data["zca_udp_port"], _DEFAULT_SETTINGS["zca_udp_port"])
+
+    # ---- valid settings ----
+
+    def test_loads_valid_custom_settings(self):
+        """All fields set to non-default but valid values are loaded correctly."""
+        custom = {
+            "zca_udp_port": 12345,
+            "broadcast_host": "192.168.1.1",
+            "broadcast_port": 9999,
+            "broadcast_interval": 2.5,
+            "microhertz_to_hertz": 500000,
+            "mm_per_hour_to_km_per_hour": 500000,
+        }
+        save_settings(self.settings_path, custom)
+        result = load_settings(self.settings_path)
+        self.assertEqual(result["zca_udp_port"], 12345)
+        self.assertEqual(result["broadcast_host"], "192.168.1.1")
+        self.assertEqual(result["broadcast_port"], 9999)
+        self.assertAlmostEqual(result["broadcast_interval"], 2.5)
+        self.assertEqual(result["microhertz_to_hertz"], 500000)
+        self.assertEqual(result["mm_per_hour_to_km_per_hour"], 500000)
+
+    def test_missing_keys_use_defaults(self):
+        """A settings file with no keys returns all defaults."""
+        save_settings(self.settings_path, {})
+        result = load_settings(self.settings_path)
+        self.assertEqual(result, _DEFAULT_SETTINGS)
+
+    # ---- per-field validation ----
+
+    def test_invalid_zca_udp_port_uses_default(self):
+        """zca_udp_port out of range falls back to default."""
+        save_settings(self.settings_path, {"zca_udp_port": 99999})
+        result = load_settings(self.settings_path)
+        self.assertEqual(result["zca_udp_port"], _DEFAULT_SETTINGS["zca_udp_port"])
+
+    def test_invalid_zca_udp_port_rewrites_file(self):
+        """When zca_udp_port is invalid the file is rewritten with the default."""
+        save_settings(self.settings_path, {"zca_udp_port": 99999})
+        load_settings(self.settings_path)
+        with open(self.settings_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual(data["zca_udp_port"], _DEFAULT_SETTINGS["zca_udp_port"])
+
+    def test_zca_udp_port_bool_is_rejected(self):
+        """A boolean value for zca_udp_port is rejected (bool is subclass of int)."""
+        save_settings(self.settings_path, {"zca_udp_port": True})
+        result = load_settings(self.settings_path)
+        self.assertEqual(result["zca_udp_port"], _DEFAULT_SETTINGS["zca_udp_port"])
+
+    def test_invalid_broadcast_host_uses_default(self):
+        """An empty broadcast_host falls back to the default."""
+        save_settings(self.settings_path, {"broadcast_host": ""})
+        result = load_settings(self.settings_path)
+        self.assertEqual(result["broadcast_host"], _DEFAULT_SETTINGS["broadcast_host"])
+
+    def test_broadcast_host_non_string_uses_default(self):
+        """A non-string broadcast_host falls back to the default."""
+        save_settings(self.settings_path, {"broadcast_host": 12345})
+        result = load_settings(self.settings_path)
+        self.assertEqual(result["broadcast_host"], _DEFAULT_SETTINGS["broadcast_host"])
+
+    def test_invalid_broadcast_port_uses_default(self):
+        """broadcast_port of 0 (out of valid range) falls back to default."""
+        save_settings(self.settings_path, {"broadcast_port": 0})
+        result = load_settings(self.settings_path)
+        self.assertEqual(result["broadcast_port"], _DEFAULT_SETTINGS["broadcast_port"])
+
+    def test_invalid_broadcast_interval_uses_default(self):
+        """A non-positive broadcast_interval falls back to default."""
+        save_settings(self.settings_path, {"broadcast_interval": -1})
+        result = load_settings(self.settings_path)
+        self.assertAlmostEqual(result["broadcast_interval"], _DEFAULT_SETTINGS["broadcast_interval"])
+
+    def test_broadcast_interval_zero_uses_default(self):
+        """broadcast_interval of 0 is not positive and falls back to default."""
+        save_settings(self.settings_path, {"broadcast_interval": 0})
+        result = load_settings(self.settings_path)
+        self.assertAlmostEqual(result["broadcast_interval"], _DEFAULT_SETTINGS["broadcast_interval"])
+
+    def test_invalid_microhertz_to_hertz_uses_default(self):
+        """A non-positive microhertz_to_hertz falls back to default."""
+        save_settings(self.settings_path, {"microhertz_to_hertz": 0})
+        result = load_settings(self.settings_path)
+        self.assertEqual(result["microhertz_to_hertz"], _DEFAULT_SETTINGS["microhertz_to_hertz"])
+
+    def test_microhertz_to_hertz_bool_is_rejected(self):
+        """A boolean value for microhertz_to_hertz is rejected."""
+        save_settings(self.settings_path, {"microhertz_to_hertz": True})
+        result = load_settings(self.settings_path)
+        self.assertEqual(result["microhertz_to_hertz"], _DEFAULT_SETTINGS["microhertz_to_hertz"])
+
+    def test_invalid_mm_per_hour_to_km_per_hour_uses_default(self):
+        """A non-positive mm_per_hour_to_km_per_hour falls back to default."""
+        save_settings(self.settings_path, {"mm_per_hour_to_km_per_hour": -5})
+        result = load_settings(self.settings_path)
+        self.assertEqual(
+            result["mm_per_hour_to_km_per_hour"],
+            _DEFAULT_SETTINGS["mm_per_hour_to_km_per_hour"],
+        )
+
+    # ---- save_settings ----
+
+    def test_save_and_reload_round_trip(self):
+        """save_settings() writes a file that load_settings() reads back identically."""
+        original = {
+            "zca_udp_port": 30000,
+            "broadcast_host": "10.0.0.1",
+            "broadcast_port": 1234,
+            "broadcast_interval": 0.5,
+            "microhertz_to_hertz": 1000000,
+            "mm_per_hour_to_km_per_hour": 1000000,
+        }
+        save_settings(self.settings_path, original)
+        result = load_settings(self.settings_path)
+        self.assertEqual(result["zca_udp_port"], original["zca_udp_port"])
+        self.assertEqual(result["broadcast_host"], original["broadcast_host"])
+        self.assertEqual(result["broadcast_port"], original["broadcast_port"])
+        self.assertAlmostEqual(result["broadcast_interval"], original["broadcast_interval"])
 
 
 # ---------------------------------------------------------------------------
