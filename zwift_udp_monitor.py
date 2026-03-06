@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import struct
 import sys
@@ -24,14 +25,152 @@ import time
 
 __version__ = "2.0.0"
 
-ZCA_UDP_PORT = 21587      # Zwift Companion App local broadcast port
-BROADCAST_HOST = "127.0.0.1"
-BROADCAST_PORT = 7878
-BROADCAST_INTERVAL = 1.0  # seconds
+# Settings file – resolved relative to this script's directory
+SETTINGS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "zwift_udp_monitor_setting.json"
+)
+
+_DEFAULT_SETTINGS: dict = {
+    "zca_udp_port": 21587,
+    "broadcast_host": "127.0.0.1",
+    "broadcast_port": 7878,
+    "broadcast_interval": 1.0,
+    "microhertz_to_hertz": 1_000_000,
+    "mm_per_hour_to_km_per_hour": 1_000_000,
+}
+
+
+def load_settings(path: str) -> dict:
+    """Load settings from a JSON file, validating every field.
+
+    If the file does not exist or contains invalid JSON the file is (re)created
+    with the default values and the defaults are returned.  Individual fields
+    that fail validation are reset to their defaults and a warning is printed;
+    the corrected settings are then written back to disk.
+    """
+
+    def _valid_port(val) -> bool:
+        return isinstance(val, int) and not isinstance(val, bool) and 1 <= val <= 65535
+
+    def _valid_positive_int(val) -> bool:
+        return isinstance(val, int) and not isinstance(val, bool) and val > 0
+
+    def _valid_positive_number(val) -> bool:
+        return isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0
+
+    settings = dict(_DEFAULT_SETTINGS)
+    needs_save = False
+
+    if not os.path.exists(path):
+        print(
+            f"ℹ️  A beállításfájl nem található, létrehozás alapértékekkel / "
+            f"Settings file not found, creating with defaults: {path}"
+        )
+        needs_save = True
+    else:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except json.JSONDecodeError:
+            print(
+                f"⚠️  Érvénytelen JSON a beállításfájlban, újralétrehozás alapértékekkel / "
+                f"Invalid JSON in settings file, recreating with defaults: {path}"
+            )
+            needs_save = True
+            raw = {}
+
+        # zca_udp_port
+        if "zca_udp_port" in raw:
+            if _valid_port(raw["zca_udp_port"]):
+                settings["zca_udp_port"] = raw["zca_udp_port"]
+            else:
+                print(
+                    "⚠️  Érvénytelen 'zca_udp_port' (1-65535 közötti int szükséges) / "
+                    "Invalid 'zca_udp_port' (must be int in range 1-65535)"
+                )
+                needs_save = True
+
+        # broadcast_host
+        if "broadcast_host" in raw:
+            val = raw["broadcast_host"]
+            if isinstance(val, str) and val:
+                settings["broadcast_host"] = val
+            else:
+                print(
+                    "⚠️  Érvénytelen 'broadcast_host' (nem üres string szükséges) / "
+                    "Invalid 'broadcast_host' (must be non-empty string)"
+                )
+                needs_save = True
+
+        # broadcast_port
+        if "broadcast_port" in raw:
+            if _valid_port(raw["broadcast_port"]):
+                settings["broadcast_port"] = raw["broadcast_port"]
+            else:
+                print(
+                    "⚠️  Érvénytelen 'broadcast_port' (1-65535 közötti int szükséges) / "
+                    "Invalid 'broadcast_port' (must be int in range 1-65535)"
+                )
+                needs_save = True
+
+        # broadcast_interval
+        if "broadcast_interval" in raw:
+            val = raw["broadcast_interval"]
+            if _valid_positive_number(val):
+                settings["broadcast_interval"] = float(val)
+            else:
+                print(
+                    "⚠️  Érvénytelen 'broadcast_interval' (pozitív szám szükséges) / "
+                    "Invalid 'broadcast_interval' (must be a positive number)"
+                )
+                needs_save = True
+
+        # microhertz_to_hertz
+        if "microhertz_to_hertz" in raw:
+            if _valid_positive_int(raw["microhertz_to_hertz"]):
+                settings["microhertz_to_hertz"] = raw["microhertz_to_hertz"]
+            else:
+                print(
+                    "⚠️  Érvénytelen 'microhertz_to_hertz' (pozitív egész szükséges) / "
+                    "Invalid 'microhertz_to_hertz' (must be a positive integer)"
+                )
+                needs_save = True
+
+        # mm_per_hour_to_km_per_hour
+        if "mm_per_hour_to_km_per_hour" in raw:
+            if _valid_positive_int(raw["mm_per_hour_to_km_per_hour"]):
+                settings["mm_per_hour_to_km_per_hour"] = raw["mm_per_hour_to_km_per_hour"]
+            else:
+                print(
+                    "⚠️  Érvénytelen 'mm_per_hour_to_km_per_hour' (pozitív egész szükséges) / "
+                    "Invalid 'mm_per_hour_to_km_per_hour' (must be a positive integer)"
+                )
+                needs_save = True
+
+    if needs_save:
+        save_settings(path, settings)
+
+    return settings
+
+
+def save_settings(path: str, settings_dict: dict) -> None:
+    """Save settings to a JSON file with pretty formatting."""
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(settings_dict, fh, indent=2)
+        fh.write("\n")
+
+
+# Load settings at import time; populate module-level constants
+_settings = load_settings(SETTINGS_FILE)
+
+ZCA_UDP_PORT: int = _settings["zca_udp_port"]          # Zwift Companion App local broadcast port
+BROADCAST_HOST: str = _settings["broadcast_host"]
+BROADCAST_PORT: int = _settings["broadcast_port"]
+BROADCAST_INTERVAL: float = _settings["broadcast_interval"]  # seconds
 
 # Unit conversion factors (confirmed from zwift_messages.proto and community repos)
-MICROHERTZ_TO_HERTZ = 1_000_000   # cadenceUHz: µHz → Hz; ×60 → RPM
-MM_PER_HOUR_TO_KM_PER_HOUR = 1_000_000  # speed: mm/h → km/h
+MICROHERTZ_TO_HERTZ: int = _settings["microhertz_to_hertz"]   # cadenceUHz: µHz → Hz; ×60 → RPM
+MM_PER_HOUR_TO_KM_PER_HOUR: int = _settings["mm_per_hour_to_km_per_hour"]  # speed: mm/h → km/h
 
 # ---------------------------------------------------------------------------
 # ProtobufDecoder – raw varint / field parser (no .proto compilation needed)
