@@ -729,11 +729,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose debug output",
     )
-    parser.add_argument(
-        "--no-fan-controller",
-        action="store_true",
-        help="Do not automatically start smart_fan_controller.py",
-    )
     return parser
 
 
@@ -793,19 +788,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     stop_event = threading.Event()
 
-    # Start smart_fan_controller.py if it exists and --no-fan-controller is not set
-    fan_controller_proc: subprocess.Popen[bytes] | None = None
-    if not args.no_fan_controller:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        fan_controller_path = os.path.join(script_dir, "smart_fan_controller.py")
-        if os.path.exists(fan_controller_path):
-            fan_controller_proc = subprocess.Popen(
-                [sys.executable, fan_controller_path],
-            )
-            print(f"🚀 smart_fan_controller.py elindítva / started (PID {fan_controller_proc.pid})")
-        else:
-            print("⚠️  smart_fan_controller.py nem található / not found – skipping auto-start")
-
     try:
         run_polling_loop(
             client,
@@ -823,15 +805,8 @@ def main(argv: list[str] | None = None) -> int:
         stop_event.set()
         broadcaster.close()
         client.close()
-        if fan_controller_proc is not None and fan_controller_proc.poll() is None:
-            fan_controller_proc.terminate()
-            try:
-                fan_controller_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                fan_controller_proc.kill()
-
+        
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
